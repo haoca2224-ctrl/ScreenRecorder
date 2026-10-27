@@ -164,6 +164,23 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
+        WM_KEYDOWN if [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0].contains(&(wp.0 as u16)) => {
+            let a = s.selected.unwrap_or(Area {
+                x: s.bounds.width as i32 / 4,
+                y: s.bounds.height as i32 / 4,
+                width: (s.bounds.width / 2) & !1,
+                height: (s.bounds.height / 2) & !1,
+            });
+            s.selected = Some(keyboard_region(
+                a,
+                s.bounds.width,
+                s.bounds.height,
+                wp.0 as u16,
+                GetKeyState(VK_SHIFT.0 as i32) < 0,
+            ));
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
         WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize => {
             if let Some(mut r) = s.selected {
                 if r.width >= 16 && r.height >= 16 {
@@ -188,8 +205,8 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let instructions = s
                 .language
                 .text(
-                    "Kéo chuột để chọn vùng  •  Enter: xác nhận  •  Esc: hủy",
-                    "Drag to select  •  Enter: confirm  •  Esc: cancel",
+                    "Kéo chọn · Mũi tên: di chuyển · Shift+mũi tên: đổi cỡ · Enter: dùng · Esc: hủy",
+                    "Drag to select · Arrows: move · Shift+arrows: resize · Enter: use · Esc: cancel",
                 )
                 .encode_utf16()
                 .collect::<Vec<_>>();
@@ -384,5 +401,57 @@ pub fn window_area(handle: isize) -> Option<Area> {
             width: (r.right - r.left).max(0) as u32 & !1,
             height: (r.bottom - r.top).max(0) as u32 & !1,
         })
+    }
+}
+
+fn keyboard_region(mut a: Area, width: u32, height: u32, key: u16, resize: bool) -> Area {
+    let dx = if key == VK_LEFT.0 {
+        -10
+    } else if key == VK_RIGHT.0 {
+        10
+    } else {
+        0
+    };
+    let dy = if key == VK_UP.0 {
+        -10
+    } else if key == VK_DOWN.0 {
+        10
+    } else {
+        0
+    };
+    if resize {
+        a.width = (a.width as i32 + dx).clamp(16, (width as i32 - a.x).max(16)) as u32 & !1;
+        a.height = (a.height as i32 + dy).clamp(16, (height as i32 - a.y).max(16)) as u32 & !1;
+    } else {
+        a.x = (a.x + dx).clamp(0, width.saturating_sub(a.width) as i32);
+        a.y = (a.y + dy).clamp(0, height.saturating_sub(a.height) as i32);
+    }
+    a
+}
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+    #[test]
+    fn region_keyboard_moves_resizes_and_stays_in_bounds() {
+        let mut a = Area {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 180,
+        };
+        for _ in 0..100 {
+            a = keyboard_region(a, 640, 360, VK_RIGHT.0, false);
+        }
+        assert_eq!(a.x, 320);
+        a = keyboard_region(a, 640, 360, VK_RIGHT.0, true);
+        assert_eq!(a.width, 320);
+        a = keyboard_region(a, 640, 360, VK_LEFT.0, true);
+        assert_eq!(a.width, 310);
+        assert!(a.fits(Area {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 360
+        }));
     }
 }

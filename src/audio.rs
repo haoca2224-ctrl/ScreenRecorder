@@ -310,11 +310,19 @@ unsafe fn endpoint(
         e.GetDevice(windows::core::PCWSTR(id.as_ptr()))
     }
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Device {
     pub id: String,
     pub name: String,
 }
+pub fn device_available(devices: &[Device], id: &str) -> bool {
+    if id.is_empty() {
+        !devices.is_empty()
+    } else {
+        devices.iter().any(|d| d.id == id)
+    }
+}
+
 pub fn devices(mic: bool) -> Vec<Device> {
     std::thread::spawn(move || unsafe {
         let result = (|| -> Result<Vec<Device>> {
@@ -368,20 +376,31 @@ pub fn meters(prefs: crate::model::Preferences, live: crate::studio::Shared) -> 
             return;
         };
         let mut meters = Vec::new();
-        for (mic, id) in [(false, &prefs.system_device), (true, &prefs.mic_device)] {
-            if let Ok(d) = endpoint(&e, mic, id) {
-                if let Ok(m) = d.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None) {
-                    meters.push((usize::from(mic), m));
-                }
-            }
-        }
+        let mut refreshed = std::time::Instant::now() - std::time::Duration::from_secs(3);
         while !flag.load(Ordering::Relaxed) {
+            if refreshed.elapsed() >= std::time::Duration::from_secs(2) {
+                meters.clear();
+                for (mic, id) in [(false, &prefs.system_device), (true, &prefs.mic_device)] {
+                    if let Ok(d) = endpoint(&e, mic, id) {
+                        if d.GetState().ok() == Some(DEVICE_STATE_ACTIVE) {
+                            if let Ok(m) = d.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None) {
+                                meters.push((usize::from(mic), m));
+                            }
+                        }
+                    }
+                }
+                refreshed = std::time::Instant::now();
+            }
+            let mut peaks = [0.0; 2];
             for (i, m) in &meters {
                 if let Ok(peak) = m.GetPeakValue() {
-                    let mut l = live.lock().unwrap();
-                    if l.status == crate::studio::Status::Ready {
-                        l.levels[*i] = peak;
-                    }
+                    peaks[*i] = peak;
+                }
+            }
+            {
+                let mut l = live.lock().unwrap();
+                if l.status == crate::studio::Status::Ready {
+                    l.levels = peaks;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -406,5 +425,20 @@ fn input_enabled(
         prefs.microphone
     } else {
         prefs.system_audio
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    #[test]
+    fn removed_explicit_endpoint_never_falls_back_to_default() {
+        let devices = vec![super::Device {
+            id: "connected".into(),
+            name: "Speaker".into(),
+        }];
+        assert!(super::device_available(&devices, ""));
+        assert!(super::device_available(&devices, "connected"));
+        assert!(!super::device_available(&devices, "unplugged"));
+        assert!(!super::device_available(&[], ""));
     }
 }

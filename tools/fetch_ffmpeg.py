@@ -19,6 +19,7 @@ with zipfile.ZipFile(archive) as package:
     for name in package.namelist():
         leaf = pathlib.PurePosixPath(name).name
         if leaf in ("ffmpeg.exe", "ffprobe.exe", "LICENSE", "LICENSE.txt"):
-            (vendor / leaf).write_bytes(package.read(name))
+            destination = "LICENSE" if leaf in ("LICENSE", "LICENSE.txt") else leaf
+            (vendor / destination).write_bytes(package.read(name))
 (vendor / "SOURCE.txt").write_text(f"URL: {url}\nSHA256: {actual}\n", encoding="utf-8")
 print(f"Verified FFmpeg: {actual}")

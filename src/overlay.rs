@@ -101,7 +101,7 @@ unsafe fn run(
         bar: HWND::default(),
         bounds,
         expanded: false,
-        compact: false,
+        compact: bounds.width < 1100,
         detached: false,
         typing: false,
         ratio: 0.0,
@@ -154,8 +154,17 @@ unsafe fn run(
     )?;
     SetLayeredWindowAttributes(s.frame, COLORREF(0x00010101), 255, LWA_COLORKEY)?;
     let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(s.bar);
-    s.scale = (dpi as f32 / 96.0)
-        .min(bounds.width as f32 / 840.0)
+    let inspection_scale = if std::env::args().any(|a| a == "--inspect-ui") {
+        std::env::var("SCREENRECORDER_UI_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.)
+            .clamp(1., 1.5)
+    } else {
+        1.
+    };
+    s.scale = (dpi as f32 / 96.0 * inspection_scale)
+        .min(bounds.width as f32 / 886.0)
         .max(0.7);
     // DWM needs an allocated surface for display affinity. Initialize off-screen,
     // then exclude both windows before moving either into the visible desktop.
@@ -230,7 +239,7 @@ unsafe fn arrange(s: &mut State, force: bool) {
             a.height as i32 + PAD * 2,
             SWP_NOACTIVATE,
         );
-        let w = ((if s.compact { 392.0 } else { 870.0 }) * s.scale) as i32;
+        let w = ((if s.compact { 524.0 } else { 870.0 }) * s.scale) as i32;
         let h = ((if s.expanded && !s.compact {
             164.0
         } else {
@@ -294,7 +303,9 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let (x, y) = point(lp);
             let mut r = RECT::default();
             let _ = GetWindowRect(hwnd, &mut r);
-            if ((x - r.left) as f32) < 28.0 * s.scale && ((y - r.top) as f32) < 52.0 * s.scale {
+            if (((x - r.left) as f32) < 28.0 * s.scale || ((y - r.top) as f32) >= 48.0 * s.scale)
+                && ((y - r.top) as f32) < 70.0 * s.scale
+            {
                 LRESULT(HTCAPTION as isize)
             } else {
                 LRESULT(HTCLIENT as isize)
@@ -399,7 +410,42 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let _ = SetFocus(Some(hwnd));
             LRESULT(0)
         }
+        WM_SYSKEYDOWN if [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0].contains(&(wp.0 as u16)) => {
+            bar_proc(hwnd, WM_KEYDOWN, wp, lp)
+        }
         WM_KEYDOWN => {
+            if GetKeyState(VK_MENU.0 as i32) < 0
+                && [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0].contains(&(wp.0 as u16))
+            {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut r);
+                let dx = if wp.0 == VK_LEFT.0 as usize {
+                    -16
+                } else if wp.0 == VK_RIGHT.0 as usize {
+                    16
+                } else {
+                    0
+                };
+                let dy = if wp.0 == VK_UP.0 as usize {
+                    -16
+                } else if wp.0 == VK_DOWN.0 as usize {
+                    16
+                } else {
+                    0
+                };
+                s.detached = true;
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left + dx,
+                    r.top + dy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER,
+                );
+                arrange(s, true);
+                return LRESULT(0);
+            }
             if !s.typing && wp.0 == VK_TAB.0 as usize {
                 if !s.buttons.is_empty() {
                     s.focus = if GetKeyState(VK_SHIFT.0 as i32) < 0 {
@@ -474,11 +520,15 @@ unsafe fn activate(s: &mut State, id: i32) {
         }
         3 => {
             let mut l = s.live.lock().unwrap();
-            l.mic_on = !l.mic_on;
+            if l.audio_available[1] {
+                l.mic_on = !l.mic_on;
+            }
         }
         4 => {
             let mut l = s.live.lock().unwrap();
-            l.system_on = !l.system_on;
+            if l.audio_available[0] {
+                l.system_on = !l.system_on;
+            }
         }
         5 => {
             s.expanded = !s.expanded;
@@ -658,7 +708,10 @@ fn tooltip(id: i32, lang: crate::model::Language, status: Status) -> &'static st
         4 => lang.text("Bật / tắt âm thanh máy", "Toggle system audio"),
         5 => lang.text("Công cụ chú thích", "Annotation tools"),
         6 => lang.text("Chụp ảnh PNG", "Take PNG screenshot"),
-        7 => lang.text("Thu gọn / mở rộng", "Compact / expand"),
+        7 => lang.text(
+            "Thu gọn / mở rộng · kéo dải dưới để di chuyển",
+            "Compact / expand · drag the bottom strip to move",
+        ),
         8 => lang.text("Mở ứng dụng", "Open application"),
         9 => lang.text("Đóng khung và toolbar", "Close frame and toolbar"),
         10 => lang.text("Thao tác phần mềm", "Interact with software"),
@@ -919,7 +972,7 @@ unsafe fn paint_bar(s: &mut State) {
             s,
             dc,
             7,
-            rect(z, 280., 8., 52., 36.),
+            rect(z, 412., 8., 52., 36.),
             "\u{E96D}",
             false,
             false,
@@ -928,15 +981,41 @@ unsafe fn paint_bar(s: &mut State) {
             s,
             dc,
             9,
-            rect(z, 338., 8., 46., 36.),
+            rect(z, 470., 8., 46., 36.),
             "\u{E8BB}",
             false,
             false,
         );
+        icon_button(
+            s,
+            dc,
+            3,
+            rect(z, 280., 8., 60., 36.),
+            if mic { "\u{E720}" } else { "\u{E74F}" },
+            mic,
+            false,
+        );
+        icon_button(
+            s,
+            dc,
+            4,
+            rect(z, 346., 8., 60., 36.),
+            if sys { "\u{E767}" } else { "\u{E74F}" },
+            sys,
+            false,
+        );
+        if s.hover.is_none() {
+            text(
+                dc,
+                rect(z, 28., 48., 488., 18.),
+                &audio_status(&s.live),
+                0x00c3b8aa,
+            );
+        }
         if let Some(id) = s.hover {
             text(
                 dc,
-                rect(z, 28., 48., 356., 18.),
+                rect(z, 28., 48., 488., 18.),
                 tooltip(id, lang, status),
                 0x00c3b8aa,
             );
@@ -1065,10 +1144,7 @@ unsafe fn paint_bar(s: &mut State) {
             text(
                 dc,
                 rect(z, 150., 48., 712., 18.),
-                lang.text(
-                    "Di chuột lên biểu tượng để xem chức năng",
-                    "Hover an icon for its label",
-                ),
+                &audio_status(&s.live),
                 0x008d8278,
             );
         }
@@ -1617,6 +1693,26 @@ unsafe fn draw_bitmap(s: &State, dc: HDC) {
         &info,
         DIB_RGB_COLORS,
     );
+}
+
+fn audio_status(live: &Shared) -> String {
+    let l = live.lock().unwrap();
+    let lang = l.language;
+    let state = |enabled: bool, available: bool| {
+        if !available {
+            lang.text("Không khả dụng", "Unavailable")
+        } else if enabled {
+            lang.text("Bật", "On")
+        } else {
+            lang.text("Tắt", "Off")
+        }
+    };
+    format!(
+        "Micro: {} · {}: {}",
+        state(l.mic_on, l.audio_available[1]),
+        lang.text("Tiếng máy", "System"),
+        state(l.system_on, l.audio_available[0])
+    )
 }
 
 #[cfg(test)]

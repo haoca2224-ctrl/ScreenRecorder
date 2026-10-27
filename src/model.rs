@@ -75,6 +75,7 @@ pub struct Preferences {
     pub mic_device: String,
     pub cursor_highlight: bool,
     pub click_effect: bool,
+    pub edit_after_recording: bool,
 }
 
 impl Default for Preferences {
@@ -99,7 +100,37 @@ impl Default for Preferences {
             mic_device: String::new(),
             cursor_highlight: false,
             click_effect: false,
+            edit_after_recording: false,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityPreset {
+    Light,
+    Balanced,
+    High,
+}
+impl QualityPreset {
+    pub fn apply(self, prefs: &mut Preferences) {
+        prefs.fps = 30;
+        prefs.encoder = "auto".into();
+        (prefs.max_height, prefs.bitrate) = match self {
+            Self::Light => (720, 4),
+            Self::Balanced => (1080, 8),
+            Self::High => (0, 16),
+        };
+    }
+    pub fn matches(self, prefs: &Preferences) -> bool {
+        let mut expected = prefs.clone();
+        self.apply(&mut expected);
+        (prefs.fps, prefs.max_height, prefs.bitrate, &prefs.encoder)
+            == (
+                expected.fps,
+                expected.max_height,
+                expected.bitrate,
+                &expected.encoder,
+            )
     }
 }
 
@@ -124,12 +155,39 @@ pub enum Event {
     Finishing,
     Progress { seconds: f64, bytes: u64 },
     Saved(PathBuf),
+    SavedWithWarning { path: PathBuf, warning: String },
     Failed(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn presets_apply_encoder_dimensions_rate_and_preserve_workflow() {
+        let mut prefs = Preferences {
+            encoder: "cpu".into(),
+            edit_after_recording: true,
+            ..Default::default()
+        };
+        for (preset, height, rate) in [
+            (QualityPreset::Light, 720, 4),
+            (QualityPreset::Balanced, 1080, 8),
+            (QualityPreset::High, 0, 16),
+        ] {
+            preset.apply(&mut prefs);
+            assert_eq!(
+                (prefs.max_height, prefs.bitrate, prefs.fps),
+                (height, rate, 30)
+            );
+            assert!(preset.matches(&prefs));
+            assert!(prefs.edit_after_recording);
+            prefs.encoder = "cpu".into();
+            assert!(!preset.matches(&prefs));
+        }
+        let legacy: Preferences = serde_json::from_str(r#"{"bitrate":12}"#).unwrap();
+        assert!(!legacy.edit_after_recording);
+        assert_eq!(legacy.bitrate, 12);
+    }
     #[test]
     fn selection_handles_reverse_drag_and_negative_monitor_origin() {
         let a = Area::from_points((-10, 501), (-809, 100));

@@ -453,6 +453,7 @@ fn run(
         folder.join("live-audio.txt"),
         "Gains and mute applied to PCM",
     )?;
+    let _active = ActiveSession::new(&folder);
     let result = run_inner(&options, commands, events, &folder, &id, live);
     result.with_context(|| format!("Dữ liệu phục hồi được giữ tại {}", folder.display()))
 }
@@ -731,10 +732,10 @@ fn run_inner(
     }
     if let Some(message) = notice {
         fs::write(output.with_extension("notice.txt"), &message)?;
-        let _ = events.send(Event::Failed(format!(
-            "{message}\nVideo đã lưu: {}",
-            output.display()
-        )));
+        let _ = events.send(Event::SavedWithWarning {
+            path: output,
+            warning: message,
+        });
     } else {
         let _ = events.send(Event::Saved(output));
     }
@@ -871,6 +872,7 @@ pub fn recover_async(folder: PathBuf) -> Controller {
 }
 
 pub fn recover(folder: &Path) -> Result<PathBuf> {
+    let _active = ActiveSession::new(folder);
     let folder = folder.canonicalize()?;
     let prefs: Preferences = serde_json::from_slice(&fs::read(folder.join("settings.json"))?)?;
     let mut videos = fs::read_dir(&folder)?
@@ -933,6 +935,20 @@ pub fn recover(folder: &Path) -> Result<PathBuf> {
     ));
     concat_parts(&folder, &parts, &output)?;
     Ok(output)
+}
+
+pub struct ActiveSession(PathBuf);
+impl ActiveSession {
+    pub fn new(dir: &Path) -> Self {
+        let p = dir.join("active.pid");
+        let _ = fs::write(&p, std::process::id().to_string());
+        Self(p)
+    }
+}
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 #[cfg(test)]
