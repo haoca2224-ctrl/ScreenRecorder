@@ -2,22 +2,44 @@
 
 Trình quay màn hình và chỉnh sửa clip Windows bằng Rust, egui, Windows Graphics Capture, WASAPI và FFmpeg.
 
+## Editor Concat — 0.9.0
+
+Editor mặc định đã thay bằng Concat 0.2.8. Bấm **Chỉnh sửa** tự tạo timeline đúng
+kích thước/FPS; **Ctrl+S** lưu, lần mở sau giữ nguyên chỉnh sửa. Giải nén toàn bộ
+ZIP, bao gồm thư mục `concat`. Các project `.taoclip` cũ được giữ nguyên và cần
+TaoClip để mở; chọn video gốc để tạo bản dựng Concat độc lập.
+Xem [CONCAT.md](CONCAT.md) về lưu trữ, build, giới hạn liên kết bản xuất và giấy phép.
+
 ## Chạy
 
-Trong thư mục mã nguồn, mở `dist\ScreenRecorder\ScreenRecorder.exe`.
-Nếu dùng ZIP portable, giải nén rồi mở `ScreenRecorder.exe` trong thư mục `ScreenRecorder`.
+Giải nén `dist\ScreenRecorder-portable.zip` rồi mở `ScreenRecorder.exe` trong thư mục `ScreenRecorder`.
+Sau khi clone repo hoặc dọn cache, chạy `powershell -ExecutionPolicy Bypass -File tools\package.ps1`
+để tải dependency và tạo lại `dist\ScreenRecorder\ScreenRecorder.exe`.
+Xem [GITHUB_UPLOAD.md](GITHUB_UPLOAD.md) để cập nhật repo GitHub và phát hành bản portable.
 Giữ `ffmpeg.exe` và `ffprobe.exe` bên cạnh ứng dụng.
 Không cần cài Rust hoặc FFmpeg trên máy sử dụng.
 
-1. Trong tab **Ghi hình**, chọn **Vùng chọn → + Chọn vùng**. Kéo chuột rồi nhấn **Enter**; **Esc** hủy chọn.
-2. Khung nổi xuất hiện. Kéo cạnh/góc để đổi kích thước, kéo phần viền trên để di chuyển. Có thể nhập rộng/cao ở cửa sổ chính. Khung được khóa khi bắt đầu phiên ghi.
-3. Chọn **Âm thanh máy**, **Micro** và thiết bị muốn dùng. Thanh mức âm giúp kiểm tra tín hiệu trước khi quay.
-4. Chọn **Nhẹ / Cân bằng / Rõ chữ**, thư mục lưu, rồi **Bắt đầu ghi**. Đếm ngược 3 giây; cửa sổ chính tự thu nhỏ.
-5. Dùng toolbar nổi để **Tạm dừng / Tiếp tục / Dừng**, bật/tắt micro hoặc tiếng máy, chụp ảnh PNG, mở công cụ **Vẽ**, hoặc trở về ứng dụng.
+1. Trong tab **Quay**, chọn **Màn hình**, **Cửa sổ** hoặc **Vùng chọn**. Nguồn được chọn có nền xanh và chữ **Đã chọn**; thumbnail và danh sách thiết bị cập nhật ở nền.
+2. Với **Vùng chọn**, kéo chuột rồi nhấn **Enter**, hoặc dùng mũi tên để tạo/di chuyển vùng, **Shift + mũi tên** để đổi cỡ; **Esc** hủy. Có thể chọn toàn màn hình rồi nhập X/Y/rộng/cao bằng bàn phím ở cửa sổ chính.
+3. Bật riêng **Micro** và **Tiếng máy**, chọn thiết bị và xem mức tín hiệu. Thiết bị đã chọn bị ngắt sẽ được báo rõ, không âm thầm đổi sang thiết bị khác.
+4. Chọn preset và cách quay, kiểm tra đường dẫn **Lưu tại**, rồi bấm **Quay**. Đếm ngược 3 giây; có thể hủy. Cửa sổ chính tự thu nhỏ khi bắt đầu quay.
+5. **Quay nhanh**: dừng rồi xem kết quả. **Quay rồi chỉnh sửa**: lưu thành công rồi mở video trong editor Concat. Màn hình kết quả có thumbnail, **Xem**, **Chỉnh sửa/Tiếp tục chỉnh sửa**, **Mở thư mục**.
+6. Toolbar nổi có tạm dừng/tiếp tục/dừng, bật/tắt âm thanh, chụp PNG và chú thích. Kéo dải sáu chấm hoặc dải dưới; khi toolbar có focus dùng **Alt + mũi tên** để di chuyển. **Tab / Shift+Tab**, **Enter / Space** thao tác nút. Bản gọn vẫn có micro và tiếng máy.
 
-Ở chế độ **Ứng dụng**, danh sách cửa sổ đang mở hiển thị tên tiến trình, tiêu đề, kích thước và PID; có ô tìm kiếm và nút quét lại. Nhấp một hàng để chọn đúng cửa sổ cần ghi.
+| Preset | Giới hạn chiều cao | FPS | Bitrate | Encoder |
+|---|---:|---:|---:|---|
+| Nhẹ | 720 px | 30 | 4 Mbps | Tự động |
+| Cân bằng | 1080 px | 30 | 8 Mbps | Tự động |
+| Chất lượng cao | Kích thước gốc | 30 | 16 Mbps | Tự động |
 
-Toolbar kéo được bằng vùng sáu chấm bên trái. **Gọn** thu về thời gian và các nút cần thiết; **Mở** trở lại thanh đầy đủ.
+Không phóng lớn nguồn nhỏ. Phần **Nâng cao** giữ encoder, bitrate, mức âm và hiệu ứng con trỏ; sửa thông số riêng hiển thị **Tùy chỉnh**. Preset mới không ghi đè cấu hình cũ cho đến khi được chọn.
+
+Nút Quay/dừng và nơi lưu nằm ngoài vùng cuộn. Khi cửa sổ nhỏ hoặc scaling cao, nội dung cấu hình cuộn được; đường dẫn dài có tooltip. Cửa sổ editor tự vừa vùng làm việc và giữ nút Xuất trong tầm nhìn. Ngôn ngữ VI/EN của recorder được chuyển tới editor khi mở.
+
+Nếu nguồn hoặc âm thanh mất trong khi quay và bộ quay vẫn cứu được MP4, ứng dụng hiển thị kết quả kèm cảnh báo; không tự mở editor. Nếu không lưu được, lỗi và phiên phục hồi được giữ. Kết nối thiết bị mới trước khi bắt đầu bản ghi để tạo đúng track âm thanh.
+
+Ở chế độ **Cửa sổ**, dùng ô tìm kiếm và chọn đúng thumbnail/tiêu đề. Danh sách tự cập nhật khoảng 2 giây; mất nguồn không làm chuyển sang cửa sổ khác. Một worker tạo thumbnail, hàng đợi tối đa 8, cache tối đa 64 ảnh; nguồn không trả khung hình bị giới hạn thời gian chờ.
+Toolbar kéo được bằng vùng sáu chấm hoặc dải trạng thái dưới. Thu gọn/mở rộng bằng nút tương ứng; tên chức năng hiện khi rê chuột hoặc chuyển focus bàn phím.
 Toolbar và viền của ứng dụng được loại khỏi video/ảnh chụp. Chú thích được ghép vào khung hình trước khi mã hóa.
 Windows vẫn có thể hiển thị viền hệ thống quanh nguồn ghi.
 
@@ -45,26 +67,42 @@ Khi đóng cửa sổ chính trong lúc ghi, ứng dụng dừng và lưu xong t
 **Ctrl+Shift+F9**: bắt đầu/dừng; **Ctrl+Shift+F10**: tạm dừng/tiếp tục.
 Tab **Thư viện** mở các video/ảnh đã lưu. Tab **Cài đặt** chứa thông số nâng cao và phục hồi phiên.
 
+### Thư viện — Phase 1 (0.7.0)
+
+- Chuyển **Lưới / Danh sách**, tìm theo tên tiếng Việt, lọc Video / Ảnh / Project / Bản xuất, lọc Yêu thích và sắp xếp ngày tạo / tên / dung lượng. Danh sách ảo không giới hạn 80 file.
+- Bấm tên một mục để xem chi tiết và các liên kết; menu **…** chứa thao tác mở, chỉnh sửa, đổi tên hiển thị, yêu thích và Recycle Bin. Ô chọn hỗ trợ nhiều mục; **Chọn kết quả** chọn toàn bộ kết quả lọc, kể cả mục ngoài màn hình.
+- **Đổi tên** chỉ sửa tên trong thư viện, không đổi tên hay di chuyển media. Xóa chuyển đúng các file đã chọn vào Recycle Bin; không tự xóa các nguồn, project hoặc bản xuất liên quan. Không xóa phiên đang ghi/hoàn thiện.
+- Trạng thái gồm **Đang hoàn thiện**, **Sẵn sàng**, **Thiếu file**, **Cần phục hồi**. Phiên bị gián đoạn trong `.sessions` có nút phục hồi. File media lỗi có **Đọc lại**; project thiếu media mở được trong editor để liên kết lại.
+- **Tiếp tục chỉnh sửa** ưu tiên project Concat (`concat.json`) đã lưu, kể cả khi bấm Chỉnh sửa từ video gốc. Nếu project mất/hỏng, ứng dụng báo lỗi thay vì âm thầm tạo timeline mới. Lưu project trước khi đóng để bảo đảm phục hồi đúng nội dung.
+- Cầu nối đăng ký project Concat vào thư viện. Bản xuất từ giao diện Concat được quét như video nếu lưu trong thư mục đang quản lý; chưa tự phân loại/liên kết bản xuất ngoài thư mục này. Các liên kết và sidecar TaoClip cũ vẫn được đọc.
+- **Thư mục & dữ liệu → Thêm thư mục…** bổ sung thư mục cần quản lý; đổi nơi lưu bản ghi vẫn giữ thư mục cũ trong thư viện. Quét thư mục con ở nền, bỏ symlink/junction và thư mục ẩn, kiểm tra thay đổi khoảng 3 giây/lượt. Hai worker đọc metadata/thumbnail, không chạy FFmpeg trong luồng vẽ giao diện.
+- Đổi tên/di chuyển file trong cùng ổ đĩa và các thư mục đã quản lý thường được nhận diện bằng Windows file ID. Khi chuyển ra ngoài thư mục đã biết hoặc sang ổ đĩa khác, dùng **Tìm lại file…** trên mục Thiếu file (hoặc thêm thư mục đích). Khi Concat báo thiếu media, dùng chức năng liên kết lại media trong Concat; file project chỉ đổi khi lưu.
+- Metadata thời lượng/kích thước video và ảnh được đọc bằng FFprobe; thumbnail 320×180 tối đa được lưu trên đĩa, GPU cache tối đa 128 ảnh. File mới cần ổn định ít nhất 2 giây trước khi đọc. FFprobe/FFmpeg có timeout riêng, file lỗi không chặn toàn bộ hàng đợi.
+
+Dữ liệu thư viện v1 nằm tại `%LOCALAPPDATA%\ScreenRecorder\library`: `index.json`, `index.backup.json`, `roots.json`, `events/`, `thumbnails/`. Một coordinator giữ khóa ghi độc quyền; file tạm được flush rồi thay thế nguyên tử bằng Windows MoveFileEx. Khi đóng ứng dụng, các lệnh còn chờ được ghi xong. Chỉ mục lỗi được phục hồi từ backup, hoặc xây dựng lại bằng danh sách thư mục, file gốc, project và nhật ký editor; bản chỉ mục không đọc được được giữ riêng. **Xây dựng lại cache** giữ tên hiển thị/yêu thích hiện có. Nếu mất cả hai chỉ mục thì không thể suy ra tên hiển thị/yêu thích từ media; cần sao lưu thư mục dữ liệu nếu muốn bảo toàn các thông tin này.
+
+Chỉ một cửa sổ recorder được ghi vào cùng một thư viện tại một thời điểm; cửa sổ thứ hai báo khóa đang được sử dụng. Các cửa sổ editor vẫn hoạt động độc lập và ghi sự kiện riêng, không sửa trực tiếp chỉ mục.
+
+Chẩn đoán trên thư viện thử riêng:
+
+```powershell
+$env:SCREENRECORDER_LIBRARY_DIR = 'D:\ThuVienThu\catalog'
+.\ScreenRecorder.exe --library-scan 'D:\ThuVienThu\recordings' 'D:\ThuVienThu\report.json'
+```
+
+Lệnh chờ tối đa 45 giây để metadata ổn định và xuất báo cáo JSON. `SCREENRECORDER_SETTINGS_PATH` dùng profile cài đặt riêng khi kiểm thử. `--inspect-ui` cùng `SCREENRECORDER_UI_CAPTURE=<đường dẫn PNG>` xuất framebuffer cửa sổ, phục vụ kiểm tra giao diện; không bật trong sử dụng thông thường.
+
+Kiểm thử Phase 2 bằng `python tools/check_recording_ui.py dist/ScreenRecorder/ScreenRecorder.exe quick 1 vi` hoặc thay `quick` bằng `edit`, `source-loss`, `disconnected`, `ready`; hai tham số cuối là app zoom và ngôn ngữ. Công cụ tự tạo cửa sổ mẫu và profile riêng, chỉ ghi cửa sổ mẫu của chính lượt chạy. Zoom phục vụ kiểm tra layout, không thay thiết lập DPI của Windows. Kết quả và giới hạn kiểm chứng nằm trong `VALIDATION.md`.
+
 ### Chỉnh sửa sau khi ghi
 
-Tab **Chỉnh sửa** dùng bố cục bàn dựng ba cột: Media/Text/Effects bên trái, Player ở giữa, thuộc tính và Export bên phải, timeline nhiều lớp ở dưới. Editor mở MP4, MKV, WebM hoặc MOV mà không nạp toàn bộ video vào RAM.
+ScreenRecorder mở **Concat 0.2.8** trong cửa sổ riêng. Bấm **Chỉnh sửa** tự đưa video
+vào timeline với kích thước/FPS gốc. Âm thanh nằm trong clip video. **Ctrl+S** lưu;
+lần bấm tiếp theo mở đúng project đã chỉnh. Video gốc không bị sửa.
 
-- Ở tab Media, kéo trực tiếp trên preview để chọn vùng crop. Hai bảng bên và timeline có thể ẩn/hiện; nội dung bảng có thanh cuộn nên dùng được trên màn hình 1280×720.
-- Kéo playhead rồi dùng **Tách**, **Cắt trước** hoặc **Cắt sau**. Mỗi đoạn sau khi tách là một clip thật: bấm để chọn, xóa, đưa sang trái/phải và đổi tốc độ 0,25×–4×. Hình và âm thanh được đổi tốc độ đồng bộ khi xuất.
-- Timeline hiển thị waveform của track âm thanh bằng proxy nhẹ tạo nền; video không có audio vẫn chỉnh sửa bình thường.
-- Thêm nhiều lớp chữ với preset **Tối giản, Đậm, Viền, Neon, Nhãn, Bóng**. Chọn chữ ngay trên Player để kéo vị trí; tay nắm tròn nằm ngoài khung chữ dùng để phóng/thu.
-- Chữ bắt dính vào tâm và safe-zone 5%, kèm đường guide. Có thể tắt **Bắt dính** trên Player.
-- Editor có Undo/Redo riêng bằng nút trên thanh đầu hoặc **Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z**; không ảnh hưởng Undo/Redo của toolbar chú thích.
-- Inspector chữ có tab **Cơ bản** và **Animation**; Animation chia riêng **In / Out** với các preset Tĩnh, Fade, Slide Up, Pop, Typewriter.
-- Preset video: **Không hiệu ứng, Soft Fade, Zoom chậm**.
-- Xuất **kích thước gốc, 720p, 1080p, vuông 1080×1080 hoặc dọc 1080×1920**.
-- Lưu **MP4/H.264, MKV/H.264 hoặc WebM/VP9**; file gốc không bị thay đổi.
-
-Các ý tưởng tổ chức preset được tham khảo ở mức thiết kế từ React Bits và Remotion; ứng dụng không nhúng React/Node. Xem `DESIGN_REFERENCES.md`.
-
-Giao diện có thể đổi giữa **Tiếng Việt** và **English** ở thanh trên hoặc tab **Cài đặt**. Lựa chọn được lưu và áp dụng cho toolbar nổi cùng màn hình chọn vùng.
-
-Toolbar dùng biểu tượng nhất quán cho cả nhóm chú thích, Undo/Redo/Xóa, có nhãn trợ giúp khi rê chuột và luôn bị loại khỏi video. Asset gốc nằm trong `assets/toolbar-symbols.svg` và `assets/editor-symbols.svg`; icon ứng dụng có các cỡ 16, 24, 32, 48, 64, 96 và 128 px, đồng thời được nhúng vào EXE Windows.
+Concat hỗ trợ nhiều track, cắt/ghép, chữ, keyframe, hiệu ứng và xuất MP4. Model AI
+là tùy chọn tải riêng. Các project TaoClip cũ được giữ nguyên và cần TaoClip để mở.
+Chi tiết vị trí project, giới hạn và giấy phép: [CONCAT.md](CONCAT.md).
 
 ## Cấu hình mặc định
 
@@ -113,17 +151,27 @@ trong bộ đệm khi mất điện hoặc tiến trình bị dừng cưỡng b�
 
 ## Biên dịch
 
-Cần Rust MSVC x64 và Visual C++ Build Tools / Windows SDK.
+Cần Rust MSVC x64, Visual C++ Build Tools / Windows SDK và Python 3.
 
 ```powershell
 python tools\fetch_ffmpeg.py
+python -X utf8 tools/prepare_concat.py
 cargo test --locked
 cargo clippy --locked -- -D warnings
 powershell -ExecutionPolicy Bypass -File tools\package.ps1
 ```
 
-`Cargo.lock` cố định dependency. Script tải FFmpeg kiểm tra SHA-256 do nhà phát hành cung cấp.
-Nguồn tải và checksum được lưu trong `vendor\SOURCE.txt`.
+Script đóng gói tải bản Concat cố định, xác minh SHA-256, giải nén runtime (không cài
+vào hệ thống), dựng Rust release và tạo ZIP. Không cần npm/Node/Electron.
+
+```powershell
+python -X utf8 tools/prepare_concat.py
+cargo run
+python -X utf8 tools/check_concat.py
+```
+
+`Cargo.lock` cố định dependency Rust. Nguồn và checksum của Concat được ghi trong
+`concat/UPSTREAM.json` của bản portable; mã nguồn Concat đúng commit được đóng kèm.
 
 ## Kiểm tra
 
@@ -148,8 +196,11 @@ Kết quả xác thực bản giao nằm trong `VALIDATION.md`.
 - `src/studio.rs`: chú thích, ghép alpha, hiệu ứng chuột và xuất PNG.
 - `src/capture.rs`: Windows Graphics Capture, cắt vùng, bộ đệm khung hình giới hạn.
 - `src/audio.rs`: WASAPI, thu loopback/micro, giữ thời gian và khoảng im lặng.
-- `src/editor.rs`: preview theo frame, crop/trim, lớp chữ động, preset và xuất đa định dạng.
+- `src/editor_launcher.rs`: mở editor đi kèm, truyền video và giao diện báo lỗi.
+- `src/concat_bridge.rs`: cầu nối MCP tạo/lưu/mở timeline và giám sát Concat.
+- `editor/.testout/` (nếu có): dữ liệu kiểm thử cũ chỉ giữ ở máy, không đưa lên GitHub. Mã và runtime TaoClip dự phòng đã được dọn.
+- `src/editor.rs`: bộ dựng cũ giữ lại cho lệnh hồi quy `--editor-smoke`, không dùng trong giao diện chính.
 - `src/recorder.rs`: thử encoder, ghi, tạm dừng, xuất và phục hồi.
 
-Mã ứng dụng: MIT. FFmpeg đi kèm là chương trình riêng có giấy phép GPL v3;
+Mã recorder: MIT. Concat: AGPL-3.0-or-later. FFmpeg đi kèm có giấy phép GPL v3;
 xem `THIRD_PARTY_NOTICES.md` và các thông báo giấy phép trong bộ portable.

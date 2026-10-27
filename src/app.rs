@@ -1,5 +1,5 @@
 use crate::{
-    audio, editor,
+    audio, editor_launcher,
     model::*,
     native, overlay, recorder,
     studio::{self, Status},
@@ -15,13 +15,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "recording_qa.rs"]
+mod qa;
+
 const INK: Color32 = Color32::from_rgb(234, 239, 247);
 const MUTED: Color32 = Color32::from_rgb(157, 174, 195);
 const PANEL: Color32 = Color32::from_rgb(23, 32, 46);
 const ACCENT: Color32 = Color32::from_rgb(111, 198, 237);
 const RED: Color32 = Color32::from_rgb(218, 62, 78);
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum Phase {
     Ready,
     Countdown,
@@ -44,6 +47,7 @@ pub struct App {
     picker: Option<Receiver<anyhow::Result<Option<Area>>>>,
     controller: Option<recorder::Controller>,
     hotkeys: Receiver<Result<u32, String>>,
+    shortcut_at: [Option<Instant>; 2],
     phase: Phase,
     countdown: Option<Instant>,
     error: Option<String>,
@@ -58,20 +62,36 @@ pub struct App {
     preview_stop: Option<Arc<AtomicBool>>,
     preview_key: String,
     preview_candidate: (String, Instant),
-    preview_texture: Option<egui::TextureHandle>,
-    preview_updated: Instant,
+
     screenshot_result: Option<Receiver<Result<PathBuf, String>>>,
     notice: Option<String>,
     system_devices: Vec<audio::Device>,
     mic_devices: Vec<audio::Device>,
     meter: Option<audio::Meter>,
     settings_path: PathBuf,
-    editor: editor::EditorState,
+    editor: editor_launcher::EditorLauncher,
+    library: crate::library_ui::LibraryUi,
+    qa_capture_at: Instant,
+    sources: crate::source_picker::Sources,
+    inventory_ready: bool,
+    show_result: bool,
+    auto_edit_pending: bool,
+    recording_audio: [bool; 2],
+    qa_stage: u8,
+    qa_clock: Instant,
+    qa_trace: Vec<String>,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
         ctx.set_theme(egui::Theme::Dark);
+        if std::env::args().any(|a| a == "--inspect-ui") {
+            if let Ok(value) = std::env::var("SCREENRECORDER_UI_SCALE") {
+                if let Ok(scale) = value.parse::<f32>() {
+                    ctx.set_zoom_factor(scale.clamp(1., 1.5));
+                }
+            }
+        }
         ctx.enable_accesskit();
         let mut fonts = egui::FontDefinitions::default();
         if let Ok(data) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
@@ -121,6 +141,9 @@ impl App {
             .unwrap_or_else(std::env::temp_dir)
             .join("ScreenRecorder")
             .join("settings.json");
+        let settings_path = std::env::var_os("SCREENRECORDER_SETTINGS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or(settings_path);
         let mut prefs: Preferences = std::fs::read(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
@@ -131,18 +154,30 @@ impl App {
         prefs.mic_volume = prefs.mic_volume.clamp(0.0, 2.0);
         let live = Arc::new(Mutex::new(studio::Live::default()));
         let meter = Some(audio::meters(prefs.clone(), live.clone()));
-        let mut app = Self {
+        let library = crate::library_ui::LibraryUi::new(prefs.output.clone());
+        Self {
+            library,
+            qa_capture_at: Instant::now(),
+            sources: crate::source_picker::Sources::new(),
+            inventory_ready: false,
+            show_result: false,
+            auto_edit_pending: false,
+            recording_audio: [false; 2],
+            qa_stage: 0,
+            qa_clock: Instant::now(),
+            qa_trace: vec![],
             prefs,
-            monitors: native::displays(),
-            windows: native::app_windows(),
+            monitors: vec![],
+            windows: vec![],
             monitor: 0,
             window: 0,
             source_filter: String::new(),
-            mode: 0,
+            mode: 1,
             region: None,
             picker: None,
             controller: None,
             hotkeys: native::hotkeys(),
+            shortcut_at: [None, None],
             phase: Phase::Ready,
             countdown: None,
             error: None,
@@ -153,32 +188,23 @@ impl App {
             close_requested: false,
             overlay: None,
             live,
-            tab: 0,
+            tab: if std::env::var_os("SCREENRECORDER_LIBRARY_VIEW").is_some() {
+                1
+            } else {
+                0
+            },
             preview_stop: None,
             preview_key: String::new(),
             preview_candidate: (String::new(), Instant::now()),
-            preview_texture: None,
-            preview_updated: Instant::now(),
+
             screenshot_result: None,
             notice: None,
-            system_devices: audio::devices(false),
-            mic_devices: audio::devices(true),
+            system_devices: vec![],
+            mic_devices: vec![],
             meter,
             settings_path,
-            editor: editor::EditorState::default(),
-        };
-        let args = std::env::args().collect::<Vec<_>>();
-        if let Some(index) = args.iter().position(|value| value == "--open-editor") {
-            if let Some(path) = args
-                .get(index + 1)
-                .map(PathBuf::from)
-                .filter(|path| path.exists())
-            {
-                app.editor.open(path);
-                app.tab = 2;
-            }
+            editor: editor_launcher::EditorLauncher::default(),
         }
-        app
     }
     fn source(&self) -> anyhow::Result<Source> {
         if self.mode == 2 {
@@ -227,25 +253,32 @@ impl App {
         }
     }
     fn begin(&mut self) {
-        if self.prefs.microphone && self.mic_devices.is_empty() {
+        if !self.inventory_ready || self.picker.is_some() {
+            return;
+        }
+        if self.prefs.microphone
+            && !audio::device_available(&self.mic_devices, &self.prefs.mic_device)
+        {
             self.error = Some(
                 self.prefs
                     .language
                     .text(
-                        "Không tìm thấy micro. Hãy kết nối thiết bị hoặc tắt Micro.",
-                        "No microphone was found. Connect one or disable Microphone.",
+                        "Micro đã chọn không khả dụng. Chọn thiết bị khác hoặc tắt Micro.",
+                        "Selected microphone unavailable. Choose another device or turn Microphone off.",
                     )
                     .into(),
             );
             return;
         }
-        if self.prefs.system_audio && self.system_devices.is_empty() {
+        if self.prefs.system_audio
+            && !audio::device_available(&self.system_devices, &self.prefs.system_device)
+        {
             self.error = Some(
                 self.prefs
                     .language
                     .text(
-                        "Không tìm thấy thiết bị phát âm thanh. Hãy kiểm tra loa/tai nghe.",
-                        "No playback device was found. Check your speakers or headphones.",
+                        "Thiết bị tiếng máy đã chọn không khả dụng. Chọn lại loa/tai nghe.",
+                        "Selected system audio device unavailable. Choose another speaker or headset.",
                     )
                     .into(),
             );
@@ -264,6 +297,8 @@ impl App {
                     return;
                 }
                 self.error = None;
+                self.auto_edit_pending = self.prefs.edit_after_recording;
+                self.show_result = false;
                 self.show_overlay();
                 self.seconds = 0.0;
                 self.bytes = 0;
@@ -277,6 +312,7 @@ impl App {
         if self.phase == Phase::Countdown {
             self.phase = Phase::Ready;
             self.countdown = None;
+            self.auto_edit_pending = false;
             return;
         }
         if let Some(c) = &self.controller {
@@ -290,23 +326,67 @@ impl App {
                 let _ = c.commands.send(Command::Pause);
                 self.phase = Phase::Pausing;
             } else if self.phase == Phase::Paused {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                if !std::env::args().any(|a| a == "--ui-smoke") {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
                 let _ = c.commands.send(Command::Resume);
                 self.phase = Phase::Starting;
             }
         }
     }
+    fn shortcut(&mut self, id: u32, ctx: &egui::Context) {
+        let Some(last) = self.shortcut_at.get_mut(id.saturating_sub(1) as usize) else {
+            return;
+        };
+        if last.is_some_and(|t| t.elapsed() < Duration::from_millis(500)) {
+            return;
+        }
+        *last = Some(Instant::now());
+        match id {
+            1 if self.phase == Phase::Ready => self.begin(),
+            1 if matches!(
+                self.phase,
+                Phase::Countdown | Phase::Recording | Phase::Paused
+            ) =>
+            {
+                self.stop()
+            }
+            2 => self.pause_resume(ctx),
+            _ => {}
+        }
+    }
     fn tick(&mut self, ctx: &egui::Context) {
         native::exclude_main_window(true);
+        self.refresh_sources(ctx);
         self.studio_tick(ctx);
         while let Ok(key) = self.hotkeys.try_recv() {
             match key {
-                Ok(1) if self.phase == Phase::Ready => self.begin(),
-                Ok(1) => self.stop(),
-                Ok(2) => self.pause_resume(ctx),
+                Ok(id) => self.shortcut(id, ctx),
                 Err(e) => self.error = Some(e),
-                _ => {}
             }
+        }
+        // Local fallback also works when another application owns the global shortcut.
+        let keys = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl && modifiers.shift => match key {
+                        egui::Key::F9 => Some(1),
+                        egui::Key::F10 => Some(2),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        for key in keys {
+            self.shortcut(key, ctx);
         }
         let selected = self.picker.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(result) = selected {
@@ -330,12 +410,17 @@ impl App {
             match self.source() {
                 Ok(source) => {
                     native::exclude_main_window(true);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    if !std::env::args().any(|a| a == "--ui-smoke") {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
                     self.stop_preview();
                     let mut prefs = self.prefs.clone();
                     // Available tracks can be enabled from the floating toolbar.
-                    prefs.system_audio = !self.system_devices.is_empty();
-                    prefs.microphone = !self.mic_devices.is_empty();
+                    prefs.system_audio =
+                        audio::device_available(&self.system_devices, &prefs.system_device);
+                    prefs.microphone =
+                        audio::device_available(&self.mic_devices, &prefs.mic_device);
+                    self.recording_audio = [prefs.system_audio, prefs.microphone];
                     self.controller = Some(recorder::start_live(
                         RecordingOptions { source, prefs },
                         Some(self.live.clone()),
@@ -344,6 +429,7 @@ impl App {
                 }
                 Err(e) => {
                     self.error = Some(e.to_string());
+                    self.auto_edit_pending = false;
                     self.phase = Phase::Ready;
                 }
             }
@@ -354,6 +440,7 @@ impl App {
             .map(|c| c.events.try_iter().collect::<Vec<_>>())
             .unwrap_or_default();
         let mut ended = false;
+        let mut opened_editor = false;
         for event in events {
             match event {
                 Event::Starting => self.phase = Phase::Starting,
@@ -375,12 +462,34 @@ impl App {
                     self.bytes = bytes;
                 }
                 Event::Saved(path) => {
+                    self.last_file = Some(path.clone());
+                    self.show_result = true;
+                    self.tab = 0;
+                    self.overlay.take();
+                    self.library.refresh();
+                    if self.auto_edit_pending && !self.close_requested {
+                        self.editor.open(path);
+                        opened_editor = true;
+                    }
+                    self.auto_edit_pending = false;
+                    self.phase = Phase::Ready;
+                    ended = true;
+                }
+                Event::SavedWithWarning { path, warning } => {
                     self.last_file = Some(path);
+                    self.show_result = true;
+                    self.tab = 0;
+                    self.error = Some(warning);
+                    self.auto_edit_pending = false;
+                    self.overlay.take();
+                    self.library.refresh();
                     self.phase = Phase::Ready;
                     ended = true;
                 }
                 Event::Failed(e) => {
                     self.error = Some(e);
+                    self.auto_edit_pending = false;
+                    self.overlay.take();
                     self.phase = Phase::Ready;
                     ended = true;
                 }
@@ -391,7 +500,9 @@ impl App {
             self.live.lock().unwrap().tool = studio::Tool::Pointer;
 
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if !opened_editor {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             if self.close_requested {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -539,7 +650,7 @@ impl App {
                 if self.preview_candidate.0 != key {
                     self.preview_candidate = (key.clone(), Instant::now());
                     self.stop_preview();
-                    self.preview_texture = None;
+
                     self.live.lock().unwrap().latest = None;
                 }
                 if self.preview_key != key
@@ -570,7 +681,6 @@ impl App {
                 }
             } else {
                 self.stop_preview();
-                self.preview_texture = None;
             }
         }
         if let Some(result) = self
@@ -630,372 +740,325 @@ impl App {
             let _ = tx.send(result);
         });
     }
-    fn preview(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if self.preview_updated.elapsed() > Duration::from_millis(250) {
-            let image = self.live.lock().unwrap().latest.clone();
-            if let Some(img) = image {
-                let pixels = studio::composite(&img, &self.live);
-                let mut rgba = pixels;
-                for p in rgba.chunks_exact_mut(4) {
-                    p.swap(0, 2);
-                    p[3] = 255;
-                }
-                let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [img.width as usize, img.height as usize],
-                    &rgba,
-                );
-                if let Some(tex) = &mut self.preview_texture {
-                    tex.set(color, egui::TextureOptions::LINEAR)
-                } else {
-                    self.preview_texture = Some(ctx.load_texture(
-                        "source_preview",
-                        color,
-                        egui::TextureOptions::LINEAR,
-                    ));
+    fn refresh_sources(&mut self, ctx: &egui::Context) {
+        self.sources.tick(ctx);
+        let inventories: Vec<_> = self.sources.inventory.try_iter().collect();
+        for mut inventory in inventories {
+            if std::env::args().any(|a| a == "--ui-smoke") {
+                let pid = std::env::var("SCREENRECORDER_QA_PATTERN_PID")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok());
+                inventory.windows.retain(|w| {
+                    w.name == "Recorder Test Pattern" && pid.is_none_or(|p| w.process_id == p)
+                });
+            }
+            let display = self.monitors.get(self.monitor).map(|m| m.handle);
+            let window = self
+                .windows
+                .get(self.window)
+                .map(|w| (w.handle, w.process_id));
+            self.monitor = if !self.inventory_ready {
+                0
+            } else {
+                display
+                    .and_then(|id| inventory.displays.iter().position(|m| m.handle == id))
+                    .unwrap_or(usize::MAX)
+            };
+            self.window = if !self.inventory_ready {
+                0
+            } else {
+                window
+                    .and_then(|id| {
+                        inventory
+                            .windows
+                            .iter()
+                            .position(|w| (w.handle, w.process_id) == id)
+                    })
+                    .unwrap_or(usize::MAX)
+            };
+            self.monitors = inventory.displays;
+            self.windows = inventory.windows;
+            self.system_devices = inventory.speakers;
+            self.mic_devices = inventory.microphones;
+            self.inventory_ready = true;
+            self.live.lock().unwrap().audio_available = [
+                audio::device_available(&self.system_devices, &self.prefs.system_device),
+                audio::device_available(&self.mic_devices, &self.prefs.mic_device),
+            ];
+            if !matches!(self.phase, Phase::Ready | Phase::Countdown) {
+                let mut live = self.live.lock().unwrap();
+                for (available, track) in live.audio_available.iter_mut().zip(self.recording_audio)
+                {
+                    *available &= track;
                 }
             }
-            self.preview_updated = Instant::now();
+            // Never silently switch to another source when a window/display disappears.
+            if self.phase == Phase::Countdown
+                && (self.source().is_err()
+                    || (self.prefs.microphone
+                        && !audio::device_available(&self.mic_devices, &self.prefs.mic_device))
+                    || (self.prefs.system_audio
+                        && !audio::device_available(
+                            &self.system_devices,
+                            &self.prefs.system_device,
+                        )))
+            {
+                self.stop();
+                self.error = Some(
+                    self.prefs
+                        .language
+                        .text(
+                            "Nguồn quay hoặc thiết bị âm thanh đã mất kết nối. Hãy chọn lại.",
+                            "Capture source or audio device disconnected. Select it again.",
+                        )
+                        .into(),
+                );
+            }
         }
-        let (r, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 152.0), egui::Sense::hover());
-        ui.painter()
-            .rect_filled(r, 8, Color32::from_rgb(11, 15, 22));
-        if let Some(tex) = &self.preview_texture {
-            let size = tex.size_vec2();
-            let factor = (r.width() / size.x).min(r.height() / size.y);
-            let image = egui::Rect::from_center_size(r.center(), size * factor);
-            ui.painter().image(
-                tex.id(),
-                image,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
-                Color32::WHITE,
-            );
-        } else {
-            ui.painter().rect_stroke(
-                r.shrink2(Vec2::new(135., 40.)),
-                8,
-                egui::Stroke::new(1.5, ACCENT),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                self.prefs
-                    .language
-                    .text("Chọn vùng để xem trước", "Select a source to preview"),
-                FontId::proportional(14.),
-                MUTED,
-            );
+    }
+    fn choose_region(&mut self, ctx: &egui::Context) {
+        if let Some(m) = self.monitors.get(self.monitor) {
+            self.overlay.take();
+            if !std::env::args().any(|a| a == "--ui-smoke") {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            self.picker = Some(native::choose_area(m.area, self.prefs.language));
         }
     }
     fn source_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let lang = self.prefs.language;
         card(ui, |ui| {
-            ui.label(
-                RichText::new(lang.text("NGUỒN GHI HÌNH", "CAPTURE SOURCE"))
-                    .small()
-                    .strong()
-                    .color(MUTED),
-            );
-            let before = self.mode;
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.mode, 0, lang.text("Vùng chọn", "Region"));
-                ui.selectable_value(&mut self.mode, 2, lang.text("Ứng dụng", "Application"));
-                ui.selectable_value(&mut self.mode, 1, lang.text("Toàn màn hình", "Fullscreen"));
-            });
-            if before != self.mode {
-                self.overlay.take();
-                self.stop_preview();
-                self.live.lock().unwrap().clear();
-                self.live.lock().unwrap().latest = None;
-                self.preview_texture = None;
-            }
-            self.preview(ui, ctx);
-            if self.mode < 2 {
-                let before = self.monitor;
-                egui::ComboBox::from_id_salt("monitor")
-                    .width(ui.available_width() - 8.)
-                    .selected_text(
-                        self.monitors
-                            .get(self.monitor)
-                            .map(|m| format!("{} · {} × {}", m.name, m.area.width, m.area.height))
-                            .unwrap_or_default(),
+            ui.label(RichText::new(lang.text("1  Nguồn quay", "1  Capture source")).strong());
+            let before = (self.mode, self.monitor, self.window);
+            ui.horizontal_wrapped(|ui| {
+                for (mode, label) in [
+                    (1, lang.text("Màn hình", "Screen")),
+                    (2, lang.text("Cửa sổ", "Window")),
+                    (0, lang.text("Vùng chọn", "Region")),
+                ] {
+                    ui.add_sized(
+                        [96., 36.],
+                        egui::Button::new(label).selected(self.mode == mode),
                     )
-                    .show_ui(ui, |ui| {
-                        for (i, m) in self.monitors.iter().enumerate() {
-                            ui.selectable_value(&mut self.monitor, i, &m.name);
-                        }
-                    });
-                if before != self.monitor {
-                    self.overlay.take();
-                    self.region = None;
+                    .clicked()
+                    .then(|| self.mode = mode);
                 }
-                if self.mode == 0 {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(lang.text("+ Chọn vùng", "+ Select region"))
-                            .clicked()
-                        {
-                            if let Some(m) = self.monitors.get(self.monitor) {
-                                self.overlay.take();
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                                self.picker =
-                                    Some(native::choose_area(m.area, self.prefs.language));
-                            }
-                        }
-                        if ui
-                            .add_enabled(
-                                self.region.is_some(),
-                                egui::Button::new(
-                                    lang.text("Hiện khung & toolbar", "Show frame & toolbar"),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.show_overlay();
-                        }
-                    });
-                    if let Some(mut r) = self.region {
-                        let old = r;
-                        ui.horizontal(|ui| {
-                            ui.label(lang.text("Rộng", "Width"));
-                            ui.add(
-                                egui::DragValue::new(&mut r.width)
-                                    .range(32..=16384)
-                                    .speed(2),
-                            );
-                            ui.label(lang.text("Cao", "Height"));
-                            ui.add(
-                                egui::DragValue::new(&mut r.height)
-                                    .range(32..=16384)
-                                    .speed(2),
-                            );
-                            ui.label(
-                                RichText::new(format!("@ {}, {}", r.x, r.y))
-                                    .small()
-                                    .color(MUTED),
-                            );
-                        });
-                        if r != old {
-                            if let Some(m) = self.monitors.get(self.monitor) {
-                                r.width = r
-                                    .width
-                                    .min((m.area.x + m.area.width as i32 - r.x).max(32) as u32)
-                                    & !1;
-                                r.height = r
-                                    .height
-                                    .min((m.area.y + m.area.height as i32 - r.y).max(32) as u32)
-                                    & !1;
-                            }
-                            self.set_region(r);
-                        }
-                    } else {
-                        ui.label(
-                            RichText::new(lang.text(
-                                "Kéo chọn vùng trên màn hình, nhấn Enter để dùng.",
-                                "Drag a region on screen, then press Enter.",
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                    }
-                } else {
-                    if ui
-                        .button(lang.text("Hiện toolbar nổi", "Show floating toolbar"))
-                        .clicked()
-                    {
-                        self.show_overlay();
-                    }
-                    ui.label(
-                        RichText::new(lang.text(
-                            "Ghi toàn bộ màn hình đã chọn.",
-                            "Record the selected display.",
-                        ))
-                        .small()
-                        .color(MUTED),
-                    );
-                }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.source_filter)
-                            .hint_text(
-                                self.prefs
-                                    .language
-                                    .text("Tìm ứng dụng hoặc cửa sổ…", "Search apps or windows…"),
-                            )
-                            .desired_width(ui.available_width() - 92.0),
-                    );
-                    if ui
-                        .button(self.prefs.language.text("Làm mới", "Refresh"))
-                        .on_hover_text(self.prefs.language.text(
-                            "Quét lại các ứng dụng đang mở",
-                            "Scan open applications again",
-                        ))
-                        .clicked()
-                    {
-                        self.windows = native::app_windows();
-                        self.window = 0;
-                    }
-                });
-                let needle = self.source_filter.trim().to_lowercase();
-                let matches = self
-                    .windows
+            });
+            if !self.inventory_ready {
+                ui.spinner();
+                ui.label(lang.text("Đang tìm nguồn…", "Finding sources…"));
+            }
+            if self.mode == 2 {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.source_filter)
+                        .hint_text(lang.text("Tìm cửa sổ…", "Find a window…"))
+                        .desired_width(f32::INFINITY),
+                );
+            }
+            let filter = self.source_filter.to_lowercase();
+            let rows: Vec<_> = if self.mode == 2 {
+                self.windows
                     .iter()
                     .enumerate()
-                    .filter(|(_, window)| {
-                        needle.is_empty()
-                            || window.name.to_lowercase().contains(&needle)
-                            || window.app.to_lowercase().contains(&needle)
+                    .filter(|(_, w)| {
+                        filter.is_empty()
+                            || format!("{} {}", w.name, w.app)
+                                .to_lowercase()
+                                .contains(&filter)
                     })
-                    .map(|(index, window)| {
+                    .map(|(i, w)| {
                         (
-                            index,
-                            window.app.clone(),
-                            window.name.clone(),
-                            window.area,
-                            window.process_id,
+                            i,
+                            format!("{} · {}", w.app, w.name),
+                            w.area,
+                            Source::Window { handle: w.handle },
                         )
                     })
-                    .collect::<Vec<_>>();
-                ui.label(
-                    RichText::new(format!(
-                        "{} ({})",
-                        self.prefs
-                            .language
-                            .text("ỨNG DỤNG ĐANG MỞ", "OPEN APPLICATIONS"),
-                        matches.len()
-                    ))
-                    .size(11.0)
-                    .strong()
-                    .color(MUTED),
-                );
-                egui::ScrollArea::vertical()
-                    .id_salt("active_app_sources")
-                    .max_height(150.0)
-                    .show(ui, |ui| {
-                        for (index, app, title, area, pid) in matches {
-                            let selected = self.window == index;
-                            let row = ui
-                                .selectable_label(
-                                    selected,
-                                    RichText::new(format!("{app}   ·   {title}")).size(13.0),
-                                )
-                                .on_hover_text(format!(
-                                    "{} × {} · PID {}\n{}",
-                                    area.width, area.height, pid, title
-                                ));
-                            if row.clicked() {
-                                self.window = index;
-                                self.overlay.take();
-                                self.stop_preview();
-                                self.preview_texture = None;
-                            }
-                            if selected {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} × {}  ·  PID {}",
-                                        area.width, area.height, pid
-                                    ))
-                                    .small()
-                                    .color(ACCENT),
-                                );
+                    .collect()
+            } else {
+                self.monitors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        (
+                            i,
+                            m.name.clone(),
+                            m.area,
+                            Source::Monitor {
+                                handle: m.handle,
+                                bounds: m.area,
+                                region: m.area,
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            egui::ScrollArea::vertical()
+                .id_salt("source_tiles")
+                .max_height(230.)
+                .show_rows(ui, 76., rows.len(), |ui, range| {
+                    for n in range {
+                        let (index, title, area, source) = &rows[n];
+                        let selected = if self.mode == 2 {
+                            self.window == *index
+                        } else {
+                            self.monitor == *index
+                        };
+                        let texture = self.sources.texture(source.clone());
+                        let response =
+                            source_tile(ui, title, *area, selected, texture.as_ref(), lang);
+                        if response.clicked() {
+                            if self.mode == 2 {
+                                self.window = *index;
+                            } else {
+                                self.monitor = *index;
                             }
                         }
-                    });
-                if self.windows.is_empty() {
-                    ui.label(
-                        RichText::new(self.prefs.language.text(
-                            "Không tìm thấy cửa sổ có thể ghi.",
-                            "No recordable windows found.",
-                        ))
-                        .small()
-                        .color(MUTED),
-                    );
+                    }
+                });
+            if rows.is_empty() && self.inventory_ready {
+                ui.label(lang.text(
+                    "Không có nguồn phù hợp. Danh sách tự cập nhật.",
+                    "No matching source. This list updates automatically.",
+                ));
+            }
+            if before != (self.mode, self.monitor, self.window) {
+                self.overlay.take();
+                self.stop_preview();
+
+                let mut live = self.live.lock().unwrap();
+                live.clear();
+                live.latest = None;
+                if before.1 != self.monitor {
+                    self.region = None;
                 }
+            }
+            if self.mode == 0 {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(lang.text("Chọn vùng…", "Select region…"))
+                        .clicked()
+                    {
+                        self.choose_region(ctx);
+                    }
+                    if ui
+                        .button(lang.text("Toàn màn hình này", "Use this display"))
+                        .clicked()
+                    {
+                        if let Some(m) = self.monitors.get(self.monitor) {
+                            self.set_region(m.area);
+                        }
+                    }
+                });
+                if let Some(mut a) = self.region {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} × {} px · X {}, Y {}",
+                            a.width, a.height, a.x, a.y
+                        ))
+                        .color(ACCENT),
+                    );
+                    egui::CollapsingHeader::new(
+                        lang.text("Nhập tọa độ bằng bàn phím", "Enter region with keyboard"),
+                    )
+                    .show(ui, |ui| {
+                        let old = a;
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, value) in [("X", &mut a.x), ("Y", &mut a.y)] {
+                                ui.label(label);
+                                ui.add(egui::DragValue::new(value));
+                            }
+                            ui.label(lang.text("Rộng", "Width"));
+                            ui.add(egui::DragValue::new(&mut a.width).range(16..=16384));
+                            ui.label(lang.text("Cao", "Height"));
+                            ui.add(egui::DragValue::new(&mut a.height).range(16..=16384));
+                        });
+                        if old != a {
+                            a.width &= !1;
+                            a.height &= !1;
+                            self.set_region(a);
+                        }
+                    });
+                } else {
+                    ui.label(lang.text(
+                        "Kéo chọn vùng hoặc dùng toàn màn hình rồi nhập tọa độ.",
+                        "Drag a region, or use this display then enter coordinates.",
+                    ));
+                }
+            }
+            if let Err(e) = self.source() {
+                ui.label(RichText::new(e.to_string()).color(Color32::from_rgb(255, 190, 197)));
+            }
+            ui.horizontal_wrapped(|ui| {
                 if ui
-                    .button(
-                        self.prefs
-                            .language
-                            .text("Hiện toolbar nổi", "Show floating toolbar"),
+                    .add_enabled(
+                        self.source().is_ok(),
+                        egui::Button::new(
+                            lang.text("Toolbar & chú thích", "Toolbar & annotations"),
+                        ),
                     )
                     .clicked()
                 {
                     self.show_overlay();
                 }
-                ui.label(
-                    RichText::new(self.prefs.language.text(
-                        "Giữ nguyên kích thước cửa sổ khi đang ghi.",
-                        "Keep the source window at the same size while recording.",
-                    ))
-                    .small()
-                    .color(MUTED),
-                );
-            }
+                ui.checkbox(&mut self.prefs.cursor, lang.text("Con trỏ", "Cursor"));
+            });
         });
     }
     fn audio_panel(&mut self, ui: &mut egui::Ui) {
         let lang = self.prefs.language;
         card(ui, |ui| {
-            ui.spacing_mut().interact_size.y = 24.0;
-            ui.spacing_mut().item_spacing.y = 5.0;
-            ui.spacing_mut().button_padding.y = 4.0;
-            ui.label(
-                RichText::new(lang.text("ÂM THANH", "AUDIO"))
-                    .small()
-                    .strong()
-                    .color(MUTED),
-            );
-            let mut changed = false;
-            let mut toggled = false;
+            ui.spacing_mut().item_spacing.y = 5.;
+            ui.spacing_mut().interact_size.y = 24.;
+            ui.spacing_mut().button_padding.y = 4.;
+            ui.label(RichText::new(lang.text("2  Âm thanh", "2  Audio")).strong());
             let levels = self.live.lock().unwrap().levels;
-            for mic in [false, true] {
-                let idx = usize::from(mic);
-                let (on, gain, id, devices, title) = if mic {
+            let mut changed = false;
+            for mic in [true, false] {
+                let (on, id, devices, title) = if mic {
                     (
                         &mut self.prefs.microphone,
-                        &mut self.prefs.mic_volume,
                         &mut self.prefs.mic_device,
                         &self.mic_devices,
-                        "Micro",
+                        lang.text("Micro", "Microphone"),
                     )
                 } else {
                     (
                         &mut self.prefs.system_audio,
-                        &mut self.prefs.system_volume,
                         &mut self.prefs.system_device,
                         &self.system_devices,
-                        lang.text("Âm thanh máy", "System audio"),
+                        lang.text("Tiếng máy", "System audio"),
                     )
                 };
-                ui.push_id(idx, |ui| {
+                ui.push_id(mic, |ui| {
                     ui.horizontal(|ui| {
-                        toggled |= ui.checkbox(on, title).changed();
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(if *on {
-                                    lang.text("Đang bật", "On")
-                                } else {
-                                    lang.text("Đã tắt", "Off")
-                                })
-                                .small()
-                                .color(if *on {
-                                    ACCENT
-                                } else {
-                                    MUTED
-                                }),
-                            );
-                        });
+                        ui.checkbox(on, title);
+                        ui.label(
+                            RichText::new(if *on {
+                                lang.text("Bật", "On")
+                            } else {
+                                lang.text("Tắt", "Off")
+                            })
+                            .small()
+                            .color(if *on { ACCENT } else { MUTED }),
+                        );
                     });
-                    egui::ComboBox::from_id_salt("device")
+                    let available = audio::device_available(devices, id);
+                    let name = if id.is_empty() {
+                        lang.text("Mặc định Windows", "Windows default").to_owned()
+                    } else {
+                        devices
+                            .iter()
+                            .find(|d| d.id == *id)
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| {
+                                lang.text("Thiết bị đã mất kết nối", "Device disconnected")
+                                    .into()
+                            })
+                    };
+                    egui::ComboBox::from_id_salt("audio_device")
                         .width(ui.available_width() - 8.)
-                        .selected_text(
-                            devices
-                                .iter()
-                                .find(|d| d.id == *id)
-                                .map(|d| d.name.as_str())
-                                .unwrap_or(lang.text("Mặc định Windows", "Windows default")),
-                        )
+                        .selected_text(egui::RichText::new(name).size(13.))
                         .show_ui(ui, |ui| {
                             changed |= ui
                                 .selectable_value(
@@ -1008,33 +1071,42 @@ impl App {
                                 changed |= ui.selectable_value(id, d.id.clone(), &d.name).changed();
                             }
                         });
-                    ui.horizontal(|ui| {
-                        ui.add_enabled(*on, egui::Slider::new(gain, 0.0..=2.0).show_value(false));
+                    if !available && self.inventory_ready {
                         ui.label(
-                            RichText::new(format!("{:.0}%", *gain * 100.))
-                                .small()
-                                .color(MUTED),
+                            RichText::new(lang.text(
+                                "Mất kết nối · chọn thiết bị khác hoặc tắt",
+                                "Disconnected · choose another device or turn off",
+                            ))
+                            .small()
+                            .color(Color32::from_rgb(255, 190, 197)),
                         );
-                    });
-                    let level = if *on { levels[idx] * *gain } else { 0. };
+                    }
+                    let level = if *on && available {
+                        levels[usize::from(mic)]
+                    } else {
+                        0.
+                    };
                     ui.add(
                         egui::ProgressBar::new(level.clamp(0., 1.))
-                            .desired_height(4.)
+                            .desired_height(8.)
                             .fill(if level > 0.95 {
                                 RED
                             } else {
                                 Color32::from_rgb(95, 211, 168)
                             }),
+                    )
+                    .on_hover_text(
+                        lang.text("Mức tín hiệu thực của thiết bị", "Live device signal level"),
                     );
+                    if mic {
+                        ui.separator();
+                    }
                 });
-                if !mic {
-                    ui.add_space(3.);
-                }
             }
-            if toggled || self.overlay.is_none() {
-                let mut l = self.live.lock().unwrap();
-                l.system_on = self.prefs.system_audio;
-                l.mic_on = self.prefs.microphone;
+            {
+                let mut live = self.live.lock().unwrap();
+                live.system_on = self.prefs.system_audio;
+                live.mic_on = self.prefs.microphone;
             }
             if changed {
                 self.meter = Some(audio::meters(self.prefs.clone(), self.live.clone()));
@@ -1044,51 +1116,142 @@ impl App {
     fn quality_panel(&mut self, ui: &mut egui::Ui) {
         let lang = self.prefs.language;
         card(ui, |ui| {
-            ui.spacing_mut().interact_size.y = 24.0;
-            ui.spacing_mut().item_spacing.y = 5.0;
-            ui.spacing_mut().button_padding.y = 4.0;
+            ui.spacing_mut().item_spacing.y = 5.;
+            ui.spacing_mut().interact_size.y = 24.;
+            ui.spacing_mut().button_padding.y = 4.;
             ui.label(
-                RichText::new(lang.text("CHẤT LƯỢNG", "QUALITY"))
-                    .small()
-                    .strong()
-                    .color(MUTED),
+                RichText::new(lang.text("3  Chất lượng & cách quay", "3  Quality & workflow"))
+                    .strong(),
             );
-            ui.horizontal(|ui| {
-                for (title, rate, limit) in [
-                    (lang.text("Nhẹ", "Light"), 4, 720),
-                    (lang.text("Cân bằng", "Balanced"), 8, 0),
-                    (lang.text("Rõ chữ", "Sharp text"), 12, 0),
+            ui.horizontal_wrapped(|ui| {
+                for (preset, label) in [
+                    (QualityPreset::Light, lang.text("Nhẹ", "Light")),
+                    (QualityPreset::Balanced, lang.text("Cân bằng", "Balanced")),
+                    (
+                        QualityPreset::High,
+                        lang.text("Chất lượng cao", "High quality"),
+                    ),
                 ] {
                     if ui
-                        .selectable_label(
-                            self.prefs.bitrate == rate && self.prefs.max_height == limit,
-                            title,
-                        )
+                        .selectable_label(preset.matches(&self.prefs), label)
                         .clicked()
                     {
-                        self.prefs.bitrate = rate;
-                        self.prefs.max_height = limit;
+                        preset.apply(&mut self.prefs);
                     }
                 }
             });
+            let resolution = match self.prefs.max_height {
+                0 => lang.text("Kích thước gốc", "Original size").to_owned(),
+                h => format!("≤ {h}p"),
+            };
+            let custom = ![
+                QualityPreset::Light,
+                QualityPreset::Balanced,
+                QualityPreset::High,
+            ]
+            .iter()
+            .any(|p| p.matches(&self.prefs));
             ui.label(
-                RichText::new(lang.text(
-                    "MP4 · 30 fps · Tăng tốc phần cứng tự động",
-                    "MP4 · 30 fps · Automatic hardware acceleration",
+                RichText::new(format!(
+                    "{}MP4 · {} · {} fps",
+                    if custom {
+                        lang.text("Tùy chỉnh · ", "Custom · ")
+                    } else {
+                        ""
+                    },
+                    resolution,
+                    self.prefs.fps
                 ))
                 .small()
                 .color(MUTED),
             );
-            ui.horizontal(|ui| {
+            egui::CollapsingHeader::new(lang.text("Nâng cao", "Advanced")).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Mbps");
+                    ui.add(egui::Slider::new(&mut self.prefs.bitrate, 2..=20));
+                });
+                egui::ComboBox::from_id_salt("encoder_quick")
+                    .selected_text(&self.prefs.encoder)
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            ("auto", lang.text("Tự động", "Automatic")),
+                            ("qsv", "Intel Quick Sync"),
+                            ("cpu", "CPU"),
+                        ] {
+                            ui.selectable_value(&mut self.prefs.encoder, value.into(), label);
+                        }
+                    });
                 ui.checkbox(
                     &mut self.prefs.cursor_highlight,
                     lang.text("Nổi con trỏ", "Cursor highlight"),
                 );
                 ui.checkbox(
                     &mut self.prefs.click_effect,
-                    lang.text("Hiệu ứng click", "Click effect"),
+                    lang.text("Hiệu ứng nhấp", "Click effect"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.prefs.mic_volume, 0.0..=2.0)
+                        .text(lang.text("Mức micro", "Mic gain")),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.prefs.system_volume, 0.0..=2.0)
+                        .text(lang.text("Mức tiếng máy", "System gain")),
                 );
             });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(
+                    &mut self.prefs.edit_after_recording,
+                    false,
+                    lang.text("Quay nhanh", "Quick recording"),
+                );
+                ui.selectable_value(
+                    &mut self.prefs.edit_after_recording,
+                    true,
+                    lang.text("Quay rồi chỉnh sửa", "Record & edit"),
+                );
+            });
+            ui.label(
+                RichText::new(if self.prefs.edit_after_recording {
+                    lang.text(
+                        "Lưu xong sẽ mở video trong editor.",
+                        "Opens the video in the editor after saving.",
+                    )
+                } else {
+                    lang.text(
+                        "Dừng quay để xem kết quả và chọn bước tiếp theo.",
+                        "Stop to see the result and choose what to do next.",
+                    )
+                })
+                .small()
+                .color(MUTED),
+            );
+        });
+    }
+    fn result_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.last_file.clone() else {
+            return;
+        };
+        let lang = self.prefs.language;
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(lang.text("Đã lưu video", "Video saved"))
+                        .strong()
+                        .color(ACCENT),
+                );
+                if ui
+                    .button(lang.text("Quay tiếp", "Record another"))
+                    .clicked()
+                {
+                    self.show_result = false;
+                }
+            });
+            if self.library.recording_result(ui, &path, lang) {
+                self.editor.open(path.clone());
+                self.tab = 2;
+            }
+            self.editor.show_error(ui, lang);
         });
     }
     fn settings(&mut self, ui: &mut egui::Ui) {
@@ -1185,6 +1348,7 @@ impl App {
                     .pick_folder()
                 {
                     self.error = None;
+                    self.auto_edit_pending = false;
                     self.controller = Some(recorder::recover_async(folder));
                     self.phase = Phase::Finishing;
                 }
@@ -1192,68 +1356,80 @@ impl App {
         });
     }
     fn library(&mut self, ui: &mut egui::Ui) {
-        let lang = self.prefs.language;
-        ui.horizontal(|ui| {
-            ui.heading(lang.text("Video & ảnh đã lưu", "Saved videos & images"));
-            if ui.button(lang.text("Mở thư mục", "Open folder")).clicked() {
-                open(&self.prefs.output);
-            }
-        });
-        ui.add_space(10.);
-        let mut files = std::fs::read_dir(&self.prefs.output)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                matches!(
-                    p.extension().and_then(|s| s.to_str()),
-                    Some("mp4" | "mkv" | "webm" | "mov" | "png")
-                )
-            })
-            .collect::<Vec<_>>();
-        files.sort();
-        files.reverse();
-        if files.is_empty() {
-            ui.label(lang.text(
-                "Bản ghi và ảnh chụp của bạn sẽ xuất hiện tại đây.",
-                "Your recordings and screenshots will appear here.",
-            ));
-        }
-        for path in files.iter().take(80) {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(path.file_name().unwrap_or_default().to_string_lossy());
-                        ui.label(
-                            RichText::new(format!(
-                                "{:.1} MB",
-                                path.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1_000_000.
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(lang.text("Mở", "Open")).clicked() {
-                            open(path);
-                        }
-                        if matches!(
-                            path.extension().and_then(|s| s.to_str()),
-                            Some("mp4" | "mkv" | "webm" | "mov")
-                        ) && ui.button(lang.text("Chỉnh sửa", "Edit clip")).clicked()
-                        {
-                            self.editor.open(path.clone());
-                            self.tab = 2;
-                        }
-                    });
-                });
+        if let Some(error) = self.error.clone() {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(Color32::LIGHT_RED, error);
+                if ui
+                    .small_button(self.prefs.language.text("Đóng", "Dismiss"))
+                    .clicked()
+                {
+                    self.error = None;
+                }
             });
+        }
+        match self
+            .library
+            .ui(ui, self.prefs.language, self.phase == Phase::Ready)
+        {
+            Some(crate::library_ui::Action::Edit(path)) => {
+                self.editor.open(path);
+                self.tab = 2;
+            }
+            Some(crate::library_ui::Action::Recover(path)) => {
+                self.controller = Some(recorder::recover_async(path));
+                self.phase = Phase::Finishing;
+            }
+            None => {}
         }
     }
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.editor.set_language(self.prefs.language);
         self.tick(ctx);
+        self.qa_tick(ctx);
+        self.library.tick(&self.prefs.output, ctx);
+        // Opt-in framebuffer capture for repeatable visual QA of this window.
+        // WGC cannot capture the recorder's normal capture-excluded window.
+        if std::env::args().any(|a| a == "--inspect-ui") {
+            if let Some(file) = std::env::var_os("SCREENRECORDER_UI_CAPTURE") {
+                for event in ctx.input(|i| i.events.clone()) {
+                    if let egui::Event::Screenshot { image, .. } = event {
+                        let mut file = PathBuf::from(&file);
+                        if std::env::args().any(|a| a == "--ui-smoke") {
+                            let label = if self.error.is_some() {
+                                "Error".into()
+                            } else if self.show_result {
+                                "Result".into()
+                            } else {
+                                format!("{:?}", self.phase)
+                            };
+                            file.set_file_name(format!("{label}.png"));
+                        }
+                        std::thread::spawn(move || {
+                            let bytes = image
+                                .pixels
+                                .iter()
+                                .flat_map(|p| p.to_array())
+                                .collect::<Vec<_>>();
+                            let _ = image::save_buffer(
+                                file,
+                                &bytes,
+                                image.size[0] as u32,
+                                image.size[1] as u32,
+                                image::ColorType::Rgba8,
+                            );
+                        });
+                    }
+                }
+                if self.qa_capture_at.elapsed() > Duration::from_secs(2) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                    self.qa_capture_at = Instant::now();
+                }
+            }
+        }
         let lang = self.prefs.language;
         if ctx.input(|i| i.viewport().close_requested()) && self.phase != Phase::Ready {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1272,10 +1448,12 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("●").size(23.).color(RED));
-                    ui.label(RichText::new("Screen Recorder").size(19.).strong());
-                    ui.add_space(25.);
+                    if ui.available_width() > 900. {
+                        ui.label(RichText::new("Screen Recorder").size(19.).strong());
+                        ui.add_space(16.);
+                    }
                     let lang = self.prefs.language;
-                    ui.selectable_value(&mut self.tab, 0, lang.text("Ghi hình", "Record"));
+                    ui.selectable_value(&mut self.tab, 0, lang.text("Quay", "Record"));
                     ui.selectable_value(&mut self.tab, 1, lang.text("Thư viện", "Library"));
                     ui.selectable_value(&mut self.tab, 2, lang.text("Chỉnh sửa", "Editor"));
                     ui.selectable_value(&mut self.tab, 3, lang.text("Cài đặt", "Settings"));
@@ -1287,29 +1465,157 @@ impl eframe::App for App {
                                 ui.selectable_value(&mut self.prefs.language, Language::Vi, "VI");
                                 ui.selectable_value(&mut self.prefs.language, Language::En, "EN");
                             });
-                        ui.label(RichText::new("STUDIO  /  0.3.1").size(11.).color(MUTED));
+                        if ui.available_width() > 180. {
+                            ui.label(
+                                RichText::new(concat!("STUDIO  /  ", env!("CARGO_PKG_VERSION")))
+                                    .size(11.)
+                                    .color(MUTED),
+                            );
+                        }
                     });
                 });
             });
-        if self.tab != 2 || self.phase != Phase::Ready {
-            egui::TopBottomPanel::bottom("controls").frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(20,12))).show(ctx,|ui|{
-            ui.horizontal(|ui|{
-                let t=self.seconds as u64;
-                ui.vertical(|ui|{ui.label(RichText::new(format!("{:02}:{:02}:{:02}",t/3600,t/60%60,t%60)).size(25.).monospace());ui.label(RichText::new(match self.phase{Phase::Ready=>lang.text("Sẵn sàng ghi hình","Ready to record"),Phase::Recording=>lang.text("Đang ghi hình","Recording"),Phase::Paused=>lang.text("Đã tạm dừng","Paused"),Phase::Countdown=>lang.text("Đếm ngược","Countdown"),Phase::Starting=>lang.text("Đang chuẩn bị…","Preparing…"),_=>lang.text("Đang hoàn tất video…","Finalizing video…")}).small().color(MUTED));});
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-                    match self.phase{
-                        Phase::Ready=>{if ui.add_sized([175.,44.],egui::Button::new(RichText::new(lang.text("●  Bắt đầu ghi","●  Start recording")).strong().color(Color32::WHITE)).fill(RED).corner_radius(8)).clicked(){self.begin();}
- if ui.button(lang.text("Chụp ảnh","Screenshot")).on_hover_text(lang.text("Lưu PNG của vùng đang chọn","Save the selected region as PNG")).clicked(){self.screenshot();}},
-                        Phase::Countdown=>{if ui.button(lang.text("Hủy","Cancel")).clicked(){self.stop();}ui.label(format!("{} {}…",lang.text("Bắt đầu sau","Starting in"),3-self.countdown.unwrap().elapsed().as_secs().min(3)));},
-                        Phase::Recording|Phase::Paused=>{if ui.add(egui::Button::new(lang.text("■  Dừng & lưu","■  Stop & save")).fill(RED)).clicked(){self.stop();}
- if ui.button(if self.phase==Phase::Paused{lang.text("Tiếp tục","Resume")}else{lang.text("Tạm dừng","Pause")}).clicked(){self.pause_resume(ctx);}
- if ui.button(lang.text("Toolbar nổi","Floating toolbar")).on_hover_text(lang.text("Hiện thanh điều khiển không ghi vào video","Show controls excluded from the video")).clicked(){self.show_overlay();}},
-                        _=>{ui.spinner();},
-                    }
+        if self.tab == 0 || self.phase != Phase::Ready {
+            egui::TopBottomPanel::bottom("controls")
+                .frame(
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::symmetric(20, 8)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let t = self.seconds as u64;
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:02}:{:02}:{:02}",
+                                    t / 3600,
+                                    t / 60 % 60,
+                                    t % 60
+                                ))
+                                .size(20.)
+                                .monospace(),
+                            );
+                            ui.label(
+                                RichText::new(match self.phase {
+                                    Phase::Ready => {
+                                        if self.error.is_some() {
+                                            lang.text(
+                                                "Có lỗi · kiểm tra thông báo",
+                                                "Error · check the message",
+                                            )
+                                        } else {
+                                            lang.text("Sẵn sàng quay", "Ready to record")
+                                        }
+                                    }
+                                    Phase::Recording => lang.text("Đang ghi hình", "Recording"),
+                                    Phase::Paused => lang.text("Đã tạm dừng", "Paused"),
+                                    Phase::Countdown => lang.text("Đếm ngược", "Countdown"),
+                                    Phase::Starting => lang.text("Đang chuẩn bị…", "Preparing…"),
+                                    _ => lang.text("Đang hoàn tất video…", "Finalizing video…"),
+                                })
+                                .small()
+                                .color(MUTED),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match self.phase {
+                                Phase::Ready => {
+                                    if ui
+                                        .add_sized(
+                                            [175., 44.],
+                                            egui::Button::new(
+                                                RichText::new(lang.text("●  Quay", "●  Record"))
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .fill(RED)
+                                            .corner_radius(8),
+                                        )
+                                        .on_hover_text("Ctrl + Shift + F9")
+                                        .clicked()
+                                    {
+                                        self.begin();
+                                    }
+                                    if ui
+                                        .button(lang.text("Chụp ảnh", "Screenshot"))
+                                        .on_hover_text(lang.text(
+                                            "Lưu PNG của vùng đang chọn",
+                                            "Save the selected region as PNG",
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.screenshot();
+                                    }
+                                }
+                                Phase::Countdown => {
+                                    if ui.button(lang.text("Hủy", "Cancel")).clicked() {
+                                        self.stop();
+                                    }
+                                    ui.label(format!(
+                                        "{} {}…",
+                                        lang.text("Bắt đầu sau", "Starting in"),
+                                        3 - self.countdown.unwrap().elapsed().as_secs().min(3)
+                                    ));
+                                }
+                                Phase::Recording | Phase::Paused => {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                lang.text("■  Dừng & lưu", "■  Stop & save"),
+                                            )
+                                            .fill(RED),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.stop();
+                                    }
+                                    if ui
+                                        .button(if self.phase == Phase::Paused {
+                                            lang.text("Tiếp tục", "Resume")
+                                        } else {
+                                            lang.text("Tạm dừng", "Pause")
+                                        })
+                                        .clicked()
+                                    {
+                                        self.pause_resume(ctx);
+                                    }
+                                    if ui
+                                        .button(lang.text("Toolbar nổi", "Floating toolbar"))
+                                        .on_hover_text(lang.text(
+                                            "Hiện thanh điều khiển không ghi vào video",
+                                            "Show controls excluded from the video",
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.show_overlay();
+                                    }
+                                }
+                                _ => {
+                                    ui.spinner();
+                                }
+                            }
+                        });
+                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {} · {} fps",
+                            if self.prefs.edit_after_recording {
+                                lang.text("Quay rồi chỉnh sửa", "Record & edit")
+                            } else {
+                                lang.text("Quay nhanh", "Quick recording")
+                            },
+                            if self.prefs.max_height == 0 {
+                                lang.text("Kích thước gốc", "Original size").into()
+                            } else {
+                                format!("≤ {}p", self.prefs.max_height)
+                            },
+                            self.prefs.fps
+                        ))
+                        .small()
+                        .color(ACCENT),
+                    );
                 });
-            });
-            ui.label(RichText::new(lang.text("Ctrl + Shift + F9  Ghi / dừng     ·     Ctrl + Shift + F10  Tạm dừng / tiếp tục","Ctrl + Shift + F9  Record / stop     ·     Ctrl + Shift + F10  Pause / resume")).size(11.).color(MUTED));
-        });
         }
         if self.tab == 0 {
             egui::TopBottomPanel::bottom("output_folder")
@@ -1325,31 +1631,33 @@ impl eframe::App for App {
                                 .size(11.)
                                 .color(MUTED),
                         );
-                        ui.add_sized(
-                            [ui.available_width() - 130., 22.],
-                            egui::Label::new(
-                                RichText::new(self.prefs.output.display().to_string()).small(),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(self.prefs.output.display().to_string());
-                        if ui
-                            .add_enabled(
-                                self.phase == Phase::Ready,
-                                egui::Button::new(lang.text("Đổi…", "Change…")).small(),
-                            )
-                            .clicked()
-                        {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_directory(&self.prefs.output)
-                                .pick_folder()
-                            {
-                                self.prefs.output = p;
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(lang.text("Mở", "Open")).clicked() {
+                                open(&self.prefs.output);
                             }
-                        }
-                        if ui.small_button(lang.text("Mở", "Open")).clicked() {
-                            open(&self.prefs.output);
-                        }
+                            if ui
+                                .add_enabled(
+                                    self.phase == Phase::Ready,
+                                    egui::Button::new(lang.text("Đổi…", "Change…")).small(),
+                                )
+                                .clicked()
+                            {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .set_directory(&self.prefs.output)
+                                    .pick_folder()
+                                {
+                                    self.prefs.output = p;
+                                }
+                            }
+                            ui.add_sized(
+                                [ui.available_width().max(20.), 22.],
+                                egui::Label::new(
+                                    RichText::new(self.prefs.output.display().to_string()).small(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(self.prefs.output.display().to_string());
+                        });
                     });
                 });
         }
@@ -1367,89 +1675,85 @@ impl eframe::App for App {
                     });
                     return;
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(error) = self.error.clone() {
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(65, 29, 39))
-                            .corner_radius(6)
-                            .inner_margin(8.)
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        RichText::new(error)
-                                            .color(Color32::from_rgb(255, 190, 197)),
-                                    );
-                                    if ui.small_button(lang.text("Đóng", "Dismiss")).clicked() {
-                                        self.error = None;
-                                    }
-                                });
-                            });
-                        ui.add_space(6.);
-                    }
-                    if let Some(notice) = self.notice.clone() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(notice).small().color(ACCENT));
-                            if ui.small_button("×").clicked() {
-                                self.notice = None;
-                            }
-                        });
-                    }
-                    match self.tab {
-                        0 => {
-                            ui.add_enabled_ui(
-                                self.phase == Phase::Ready && self.picker.is_none(),
-                                |ui| {
-                                    let width = ui.available_width();
-                                    let left = (width - 8.) * 0.56;
-                                    ui.horizontal_top(|ui| {
-                                        ui.allocate_ui_with_layout(
-                                            Vec2::new(left, 360.),
-                                            egui::Layout::top_down(egui::Align::Min),
-                                            |ui| {
-                                                self.source_panel(ui, ctx);
-                                            },
+                if self.tab == 1 {
+                    self.library(ui);
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt(("workspace", self.tab, self.show_result))
+                    .show(ui, |ui| {
+                        if let Some(error) = self.error.clone() {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(65, 29, 39))
+                                .corner_radius(6)
+                                .inner_margin(8.)
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new(error)
+                                                .color(Color32::from_rgb(255, 190, 197)),
                                         );
-                                        ui.allocate_ui_with_layout(
-                                            Vec2::new(width - left - 8., 360.),
-                                            egui::Layout::top_down(egui::Align::Min),
-                                            |ui| {
-                                                self.audio_panel(ui);
-                                                self.quality_panel(ui);
-                                            },
-                                        );
+                                        if ui.small_button(lang.text("Đóng", "Dismiss")).clicked()
+                                        {
+                                            self.error = None;
+                                        }
                                     });
-                                },
-                            );
-                            if let Some(path) = &self.last_file {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(lang.text("Đã lưu video", "Video saved"))
-                                            .small()
-                                            .color(ACCENT),
-                                    );
-                                    if ui
-                                        .small_button(lang.text("Xem video", "Open video"))
-                                        .clicked()
-                                    {
-                                        open(path);
-                                    }
-                                    if ui
-                                        .small_button(lang.text("Chỉnh sửa", "Edit clip"))
-                                        .clicked()
-                                    {
-                                        self.editor.open(path.clone());
-                                        self.tab = 2;
-                                    }
+                                });
+                            ui.add_space(6.);
+                        }
+                        if let Some(notice) = self.notice.clone() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(notice).small().color(ACCENT));
+                                if ui.small_button("×").clicked() {
+                                    self.notice = None;
+                                }
+                            });
+                        }
+                        match self.tab {
+                            0 => {
+                                if self.show_result {
+                                    self.result_panel(ui);
+                                }
+                                ui.add_enabled_ui(
+                                    self.phase == Phase::Ready && self.picker.is_none(),
+                                    |ui| {
+                                        let width = ui.available_width();
+                                        if width < 680. {
+                                            self.source_panel(ui, ctx);
+                                            self.audio_panel(ui);
+                                            self.quality_panel(ui);
+                                            return;
+                                        }
+                                        let left = (width - 16.) * 0.52;
+                                        ui.horizontal_top(|ui| {
+                                            ui.allocate_ui_with_layout(
+                                                Vec2::new(left, 360.),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    self.source_panel(ui, ctx);
+                                                },
+                                            );
+                                            ui.allocate_ui_with_layout(
+                                                Vec2::new(width - left - 16., 360.),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    self.audio_panel(ui);
+                                                    self.quality_panel(ui);
+                                                },
+                                            );
+                                        });
+                                    },
+                                );
+                            }
+                            1 => self.library(ui),
+                            2 => {}
+                            _ => {
+                                ui.add_enabled_ui(self.phase == Phase::Ready, |ui| {
+                                    self.settings(ui)
                                 });
                             }
                         }
-                        1 => self.library(ui),
-                        2 => {}
-                        _ => {
-                            ui.add_enabled_ui(self.phase == Phase::Ready, |ui| self.settings(ui));
-                        }
-                    }
-                });
+                    });
             });
         ctx.request_repaint_after(Duration::from_millis(80));
     }
@@ -1473,4 +1777,86 @@ fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
             content(ui);
         });
     ui.add_space(6.);
+}
+
+fn source_tile(
+    ui: &mut egui::Ui,
+    title: &str,
+    area: Area,
+    selected: bool,
+    texture: Option<&egui::TextureHandle>,
+    lang: Language,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 70.), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            title,
+        )
+    });
+    ui.painter().rect_filled(
+        rect,
+        6,
+        if selected {
+            Color32::from_rgb(40, 86, 110)
+        } else {
+            Color32::from_rgb(14, 23, 35)
+        },
+    );
+    if response.has_focus() || response.hovered() {
+        ui.painter().rect_stroke(
+            rect,
+            6,
+            egui::Stroke::new(2., ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let thumb = egui::Rect::from_min_size(rect.min + egui::vec2(8., 8.), egui::vec2(96., 54.));
+    ui.painter()
+        .rect_filled(thumb, 4, Color32::from_rgb(9, 15, 23));
+    if let Some(t) = texture {
+        let scale = (thumb.width() / t.size_vec2().x).min(thumb.height() / t.size_vec2().y);
+        ui.painter().image(
+            t.id(),
+            egui::Rect::from_center_size(thumb.center(), t.size_vec2() * scale),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter().text(
+            thumb.center(),
+            egui::Align2::CENTER_CENTER,
+            lang.text("Xem trước…", "Preview…"),
+            FontId::proportional(11.),
+            MUTED,
+        );
+    }
+    let text_rect = egui::Rect::from_min_max(
+        rect.min + egui::vec2(116., 8.),
+        rect.max - egui::vec2(8., 4.),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.add(egui::Label::new(RichText::new(title).strong()).truncate());
+    child.label(
+        RichText::new(format!(
+            "{} × {} · {}",
+            area.width,
+            area.height,
+            if selected {
+                lang.text("Đã chọn", "Selected")
+            } else {
+                lang.text("Chọn nguồn này", "Select source")
+            }
+        ))
+        .small()
+        .color(if selected { INK } else { MUTED }),
+    );
+    response.on_hover_text(title)
 }

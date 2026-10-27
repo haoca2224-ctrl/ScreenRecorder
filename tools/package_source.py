@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import os
 import zipfile
 
 
@@ -16,6 +17,7 @@ OUTPUT = ROOT / "dist" / f"ScreenRecorder-source-v{VERSION}.zip"
 ROOT_FILES = {
     ".gitignore",
     "Cargo.lock",
+    "CONCAT.md",
     "Cargo.toml",
     "build.rs",
     "DESIGN_REFERENCES.md",
@@ -30,12 +32,12 @@ SOURCE_DIRS = ("assets", "examples", "src", "tools")
 
 def included_files() -> list[pathlib.Path]:
     files = [ROOT / name for name in sorted(ROOT_FILES)]
+    excluded = {"node_modules", "dist", "release", ".testout", ".git", "__pycache__", "models", "bin"}
     for folder in SOURCE_DIRS:
-        files.extend(
-            path
-            for path in sorted((ROOT / folder).rglob("*"))
-            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
-        )
+        for base, directories, names in os.walk(ROOT / folder):
+            directories[:] = sorted(d for d in directories if d not in excluded)
+            files.extend(pathlib.Path(base) / name for name in sorted(names)
+                         if not name.endswith((".pyc", ".log")))
     return files
 
 

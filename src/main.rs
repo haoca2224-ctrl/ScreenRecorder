@@ -2,17 +2,80 @@
 mod app;
 mod audio;
 mod capture;
+mod concat_bridge;
+// Retained for the existing --editor-smoke regression command.
+#[allow(dead_code)]
 mod editor;
+mod editor_launcher;
+mod library;
+mod library_ui;
 mod model;
 mod native;
 mod overlay;
 mod recorder;
+mod source_picker;
 mod studio;
 mod test_pattern;
 
 fn main() {
     native::setup_dpi();
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--concat-session") {
+        let result = args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("Missing status path"))
+            .and_then(|status| {
+                concat_bridge::session(
+                    args.get(3).map(std::path::Path::new),
+                    std::path::Path::new(status),
+                )
+            });
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--concat-check") {
+        let result = (|| -> anyhow::Result<()> {
+            let input = std::path::Path::new(
+                args.get(2)
+                    .ok_or_else(|| anyhow::anyhow!("Missing input"))?,
+            );
+            let output = std::path::Path::new(
+                args.get(3)
+                    .ok_or_else(|| anyhow::anyhow!("Missing output"))?,
+            );
+            let report = concat_bridge::check(input, output)?;
+            std::fs::write(
+                output.with_extension("report.json"),
+                serde_json::to_vec_pretty(&report)?,
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--library-scan") {
+        let result = library::diagnose(&args);
+        if let Err(e) = result {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--open-editor") {
+        match editor_launcher::launch(args.get(2).map(std::path::Path::new)) {
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--test-pattern") {
         test_pattern::run();
         return;
@@ -118,11 +181,24 @@ fn main() {
         }
         return;
     }
+    let display = native::displays()
+        .first()
+        .map(|m| m.area)
+        .unwrap_or(model::Area {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        });
+    let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as f32 / 96.;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 650.0])
+            .with_inner_size([
+                1120.0f32.min((display.width as f32 - 48.) / scale),
+                650.0f32.min((display.height as f32 - 90.) / scale),
+            ])
             .with_position([24.0, 16.0])
-            .with_min_inner_size([900.0, 540.0])
+            .with_min_inner_size([640.0, 360.0])
             .with_icon(app_icon())
             .with_title("Screen Recorder"),
         renderer: eframe::Renderer::Glow,
@@ -214,6 +290,9 @@ fn smoke(args: &[String]) -> anyhow::Result<()> {
                     break;
                 }
                 Event::Failed(e) => anyhow::bail!(e),
+                Event::SavedWithWarning { path, warning } => {
+                    anyhow::bail!("{warning}\nOUTPUT={}", path.display())
+                }
                 _ => {}
             }
         }

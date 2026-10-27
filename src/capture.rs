@@ -182,6 +182,14 @@ pub struct ScreenSession {
 }
 impl ScreenSession {
     pub fn start(source: &Source, cursor: bool, fps: u32) -> Result<Self> {
+        Self::start_with_timeout(source, cursor, fps, Duration::from_secs(8))
+    }
+    pub fn start_with_timeout(
+        source: &Source,
+        cursor: bool,
+        fps: u32,
+        timeout: Duration,
+    ) -> Result<Self> {
         let latest = Arc::new(Mutex::new(Latest::default()));
         let mut flags = Flags {
             latest: latest.clone(),
@@ -236,7 +244,7 @@ impl ScreenSession {
             latest,
             control: Some(control),
         };
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + timeout;
         while session.latest.lock().unwrap().image.is_none() {
             if let Some(e) = session.latest.lock().unwrap().error.clone() {
                 bail!(e);
